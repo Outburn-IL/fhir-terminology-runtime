@@ -1,0 +1,62 @@
+{
+  "name": "fhir-terminology-runtime",
+  "version": "0.1.0",
+  "description": "Runtime FHIR terminology utilities",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "author": "Outburn Ltd.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "npm run clean && tsup",
+    "clean": "rimraf dist",
+    "clear:cache": "rimraf test/.test-cache",
+    "prepublishOnly": "npm run build",
+    "test": "vitest run",
+    "test:hard": "npm run clear:cache && vitest run"
+  },
+  "keywords": [
+    "fhir",
+    "hl7",
+    "terminology",
+    "valueset",
+    "codesystem",
+    "expansion",
+    "package",
+    "conformance",
+    "cache",
+    "runtime"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Outburn-IL/fhir-terminology-runtime.git"
+  },
+  "dependencies": {
+    "fhir-package-explorer": "file:../fhir-package-explorer",
+    "fs-extra": "^11.3.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.24.0",
+    "@outburn/types": "file:../outburn-types",
+    "@types/fs-extra": "^11.0.4",
+    "eslint": "^9.39.2",
+    "rimraf": "^6.1.2",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.49.0",
+    "vitest": "^3.2.4"
+  }
+}
