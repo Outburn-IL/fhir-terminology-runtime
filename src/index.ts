@@ -30,7 +30,8 @@ import {
 import type {
   TerminologyCacheMode,
   TerminologyRuntimeConfig,
-  Prethrower
+  Prethrower,
+  CountResult
 } from '../types';
 
 const versionedCacheDir = `v${ftrVersion.split('.').slice(0, 2).join('.')}.x`;
@@ -42,6 +43,7 @@ export class FhirTerminologyRuntime {
   private cachePath: string;
   private cacheMode: TerminologyCacheMode;
   private fhirVersion: FhirVersion;
+  private expansionCountCache: Map<string, CountResult> = new Map();
 
   private constructor(fpe: FhirPackageExplorer, cacheMode: TerminologyCacheMode, fhirVersion: FhirVersion, logger?: Logger) {
     if (logger) {
@@ -434,6 +436,66 @@ export class FhirTerminologyRuntime {
   }
 
   /**
+   * Get the count of concepts in the expansion of a ValueSet.
+   * Results are cached in memory.
+   */
+  public async getValueSetExpansionCount(identifier: string | FileIndexEntryWithPkg, packageFilter?: FhirPackageIdentifier): Promise<CountResult> {
+    const cacheKey = `${JSON.stringify(identifier)}|${JSON.stringify(packageFilter)}`;
+    if (this.expansionCountCache.has(cacheKey)) {
+      return this.expansionCountCache.get(cacheKey)!;
+    }
+
+    let metadata: FileIndexEntryWithPkg | undefined;
+
+    try {
+      if (typeof identifier === 'string') {
+        metadata = await this.getValueSetMetadata(identifier, packageFilter);
+      } else {
+        metadata = identifier;
+      }
+    } catch (e) {
+      // Resolution failed
+      const result: CountResult = { status: 'unknown', reason: 'unknown-valueset' };
+      this.expansionCountCache.set(cacheKey, result);
+      return result;
+    }
+
+    if (!metadata) {
+      const result: CountResult = { status: 'unknown', reason: 'unknown-valueset' };
+      this.expansionCountCache.set(cacheKey, result);
+      return result;
+    }
+
+    try {
+      const expansion = await this.expandValueSetByMeta(metadata);
+
+      // Check for failure stub
+      if (expansion?.expansion?.__failure) {
+        const result: CountResult = { status: 'unknown', reason: 'unexpandable-valueset' };
+        this.expansionCountCache.set(cacheKey, result);
+        return result;
+      }
+
+      let count = 0;
+      if (typeof expansion?.expansion?.total === 'number') {
+        count = expansion.expansion.total;
+      } else if (Array.isArray(expansion?.expansion?.contains)) {
+        count = expansion.expansion.contains.length;
+      }
+
+      const result: CountResult = { status: 'ok', count };
+      this.expansionCountCache.set(cacheKey, result);
+      return result;
+
+    } catch (e) {
+      // Expansion failed
+      const result: CountResult = { status: 'unknown', reason: 'unexpandable-valueset' };
+      this.expansionCountCache.set(cacheKey, result);
+      return result;
+    }
+  }
+
+  /**
    * Resolve a CodeSystem by canonical URL inside the provided source package context.
    * Will NOT attempt a global resolution fallback (that is the responsibility of the external caller / entrypoint).
    * Only CodeSystems with content === 'complete' are eligible for expansion; if not complete an error is thrown.
@@ -509,7 +571,9 @@ export class FhirTerminologyRuntime {
 export type {
   TerminologyCacheMode,
   TerminologyRuntimeConfig,
-  Prethrower
+  Prethrower,
+  CountResult,
+  UnknownReason
 } from '../types';
 
 // Export implicit code systems for external usage

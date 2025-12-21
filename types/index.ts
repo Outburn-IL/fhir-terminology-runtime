@@ -46,3 +46,11 @@ export type TerminologyRuntimeConfig = {
    */
   logger?: Logger;
 };
+
+export type UnknownReason =
+  | 'unexpandable-valueset'
+  | 'unknown-valueset';
+
+export type CountResult =
+  | { status: 'ok'; count: number }
+  | { status: 'unknown'; reason: UnknownReason };
