@@ -18,14 +18,14 @@ import path from 'path';
 import fs from 'fs-extra';
 import { version as ftrVersion } from '../package.json';
 import {
-  FhirPackageExplorer,
-  FileIndexEntryWithPkg
+  FhirPackageExplorer
 } from 'fhir-package-explorer';
 
 import {
   FhirPackageIdentifier,
   FhirVersion,
-  Logger
+  Logger,
+  FileIndexEntryWithPkg
 } from '@outburn/types';
 import type {
   TerminologyCacheMode,
@@ -308,7 +308,7 @@ export class FhirTerminologyRuntime {
       conceptMap.set(systemUrl, codesForSystem);
     }
 
-    // Combine with referenced VS per JSONata rules
+    // Combine with referenced VS
     if (vsUnion.size > 0) {
       if (hasSystem) {
         // Intersect for that system
