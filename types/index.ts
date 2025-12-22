@@ -45,11 +45,63 @@ export type TerminologyRuntimeConfig = {
    * Optional logger for logging messages.
    */
   logger?: Logger;
+
+  /**
+   * Optional external cache for ValueSet membership checks.
+   * Used by FhirTerminologyRuntime.inValueSet for high-performance lookups.
+   */
+  membershipCache?: TerminologyMembershipCache;
 };
 
 export type UnknownReason =
   | 'unexpandable-valueset'
-  | 'unknown-valueset';
+  | 'unknown-valueset'
+  | 'duplicate-code';
+
+/**
+ * Minimal shape for Coding-like inputs.
+ */
+export type CodingLike = {
+  system: string;
+  code: string;
+};
+
+export type ConceptProps = {
+  system: string;
+  code: string;
+  display?: string;
+  version?: string;
+};
+
+export type MembershipResult =
+  | { status: 'member'; concept: ConceptProps }
+  | { status: 'not-member' }
+  | { status: 'unknown'; reason: UnknownReason };
+
+export type ValueSetDeterministicKey = {
+  packageId: string;
+  packageVersion: string;
+  filename: string;
+};
+
+export type MembershipCacheEntry =
+  | { status: 'member'; conceptsBySystem: Record<string, ConceptProps> }
+  | { status: 'not-member' };
+
+/**
+ * External (injectable) async cache for ValueSet membership lookups.
+ *
+ * - Stores/returns individual code entries (no full ValueSet blobs).
+ * - Can optionally support bulk priming of a whole ValueSet (recommended for large ValueSets).
+ */
+export interface TerminologyMembershipCache {
+  getCode(vs: ValueSetDeterministicKey, code: string): Promise<MembershipCacheEntry | undefined>;
+  setCode(vs: ValueSetDeterministicKey, code: string, entry: MembershipCacheEntry): Promise<void>;
+
+  bulkSetCodes?(vs: ValueSetDeterministicKey, entries: Array<[string, MembershipCacheEntry]>): Promise<void>;
+  isValueSetPrimed?(vs: ValueSetDeterministicKey): Promise<boolean>;
+  markValueSetPrimed?(vs: ValueSetDeterministicKey): Promise<void>;
+}
 
 export type CountResult =
   | { status: 'ok'; count: number }

@@ -87,8 +87,92 @@ The result type is:
 ```ts
 type CountResult =
   | { status: 'ok'; count: number }
-  | { status: 'unknown'; reason: 'unexpandable-valueset' | 'unknown-valueset' };
+  | { status: 'unknown'; reason: 'unexpandable-valueset' | 'unknown-valueset' | 'duplicate-code' };
 ```
+
+### 4. Check membership (`inValueSet`)
+
+For fast validation of whether a code is in a ValueSet, use `inValueSet`.
+
+It accepts either:
+- a plain code string (common case; system is implicit), OR
+- a Coding-like object with `{ system, code }`.
+
+```ts
+const r1 = await ftr.inValueSet('A', 'administrative-gender');
+//    ^ MembershipResult
+
+const r2 = await ftr.inValueSet({ system: 'http://hl7.org/fhir/administrative-gender', code: 'male' }, 'administrative-gender');
+```
+
+Return type:
+```ts
+type ConceptProps = {
+  system: string;
+  code: string;
+  display?: string;
+  version?: string;
+};
+
+type MembershipResult =
+  | { status: 'member'; concept: ConceptProps }
+  | { status: 'not-member' }
+  | { status: 'unknown'; reason: UnknownReason };
+```
+
+Unknown reasons:
+- `unknown-valueset`: the ValueSet identifier could not be resolved.
+- `unexpandable-valueset`: the ValueSet could not be expanded locally.
+- `duplicate-code`: returned only for **code-only** lookups when the same code exists under **multiple systems** in the ValueSet (ambiguous without a system).
+
+## Membership caching (`membershipCache`)
+
+`inValueSet` is optimized for very fast repeated lookups and uses multiple caching layers:
+- An in-memory LRU for **small** ValueSets (≤ 50 unique codes), holding up to 100 ValueSets.
+- An in-memory LRU for **per-code** results for larger ValueSets, holding up to 10,000 code lookups.
+- An optional **external async cache** (injectable) used as a fallback and for persistence/distributed caching.
+
+### Configure an external membership cache
+
+Provide a `membershipCache` in `FhirTerminologyRuntime.create(...)`:
+
+```ts
+const ftr = await FhirTerminologyRuntime.create({
+  fpe,
+  cacheMode: 'lazy',
+  fhirVersion: '4.0.1',
+  membershipCache
+});
+```
+
+The external cache is keyed deterministically by ValueSet metadata: `(packageId, packageVersion, filename)`.
+
+Interface (simplified):
+```ts
+type ValueSetDeterministicKey = {
+  packageId: string;
+  packageVersion: string;
+  filename: string;
+};
+
+type MembershipCacheEntry =
+  | { status: 'member'; conceptsBySystem: Record<string, ConceptProps> }
+  | { status: 'not-member' };
+
+interface TerminologyMembershipCache {
+  getCode(vs: ValueSetDeterministicKey, code: string): Promise<MembershipCacheEntry | undefined>;
+  setCode(vs: ValueSetDeterministicKey, code: string, entry: MembershipCacheEntry): Promise<void>;
+
+  // Optional: more efficient priming for large ValueSets
+  bulkSetCodes?(vs: ValueSetDeterministicKey, entries: Array<[string, MembershipCacheEntry]>): Promise<void>;
+  isValueSetPrimed?(vs: ValueSetDeterministicKey): Promise<boolean>;
+  markValueSetPrimed?(vs: ValueSetDeterministicKey): Promise<void>;
+}
+```
+
+Priming behavior:
+- When a ValueSet is **small**, `inValueSet` may populate the external cache for completeness.
+- When a ValueSet is **large**, `inValueSet` will populate/prime the external cache the first time a code is checked against that ValueSet.
 
 ## ValueSet Expansion Details
 

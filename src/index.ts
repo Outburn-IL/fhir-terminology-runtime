@@ -31,7 +31,13 @@ import type {
   TerminologyCacheMode,
   TerminologyRuntimeConfig,
   Prethrower,
-  CountResult
+  CountResult,
+  MembershipResult,
+  ConceptProps,
+  CodingLike,
+  TerminologyMembershipCache,
+  ValueSetDeterministicKey,
+  MembershipCacheEntry
 } from '../types';
 
 const versionedCacheDir = `v${ftrVersion.split('.').slice(0, 2).join('.')}.x`;
@@ -45,7 +51,30 @@ export class FhirTerminologyRuntime {
   private fhirVersion: FhirVersion;
   private expansionCountCache: Map<string, CountResult> = new Map();
 
-  private constructor(fpe: FhirPackageExplorer, cacheMode: TerminologyCacheMode, fhirVersion: FhirVersion, logger?: Logger) {
+  private membershipCache?: TerminologyMembershipCache;
+
+  // Cache for resolving ValueSet identifiers (url/id/name) -> metadata.
+  // Keyed by identifier + packageFilter.
+  private valueSetIdentifierMetaCache: Map<string, Promise<FileIndexEntryWithPkg>> = new Map();
+
+  // General-purpose resolveMeta cache to avoid repeated FPE lookups.
+  private resolveMetaCache: Map<string, Promise<any>> = new Map();
+
+  // LRU: small ValueSet indexes (<= 50 unique codes)
+  private smallValueSetIndexLru = new LruCache<string, SmallValueSetIndex>(100);
+  // LRU: per-code membership results for non-small ValueSets
+  private membershipResultLru = new LruCache<string, MembershipResult>(10000);
+
+  // In-memory guard for avoiding repeated external priming per VS key.
+  private externallyPrimedValueSets: Set<string> = new Set();
+
+  private constructor(
+    fpe: FhirPackageExplorer,
+    cacheMode: TerminologyCacheMode,
+    fhirVersion: FhirVersion,
+    logger?: Logger,
+    membershipCache?: TerminologyMembershipCache
+  ) {
     if (logger) {
       this.logger = logger;
       this.prethrow = customPrethrower(this.logger);
@@ -57,6 +86,7 @@ export class FhirTerminologyRuntime {
     this.fhirVersion = fhirVersion;
     this.fpe = fpe;
     this.cachePath = fpe.getCachePath();
+    this.membershipCache = membershipCache;
   };
 
   /**
@@ -78,7 +108,7 @@ export class FhirTerminologyRuntime {
       const fpe = config.fpe;
 
       // Create a new FhirTerminologyRuntime instance
-      const ftr = new FhirTerminologyRuntime(fpe, cacheMode, fhirVersion, config.logger);
+      const ftr = new FhirTerminologyRuntime(fpe, cacheMode, fhirVersion, config.logger, config.membershipCache);
 
       let precache: boolean = false;
 
@@ -153,11 +183,75 @@ export class FhirTerminologyRuntime {
     return await this.fpe.resolve({ filename, package: { id: packageId, version: packageVersion } });
   }
 
+  private stableStringify(value: any): string {
+    const seen = new WeakSet<object>();
+    const normalize = (v: any): any => {
+      if (v === null || typeof v !== 'object') return v;
+      if (seen.has(v)) return '[Circular]';
+      seen.add(v);
+      if (Array.isArray(v)) return v.map(normalize);
+      const out: any = {};
+      for (const key of Object.keys(v).sort()) {
+        const val = (v as any)[key];
+        if (val === undefined) continue;
+        out[key] = normalize(val);
+      }
+      return out;
+    };
+    return JSON.stringify(normalize(value));
+  }
+
+  private toValueSetDeterministicKey(meta: FileIndexEntryWithPkg): ValueSetDeterministicKey {
+    const packageId = (meta as any).__packageId as string;
+    const packageVersion = (meta as any).__packageVersion as string;
+    const filename = (meta as any).filename as string;
+    if (!packageId || !packageVersion || !filename) {
+      throw new Error('ValueSet metadata missing deterministic key fields (packageId/packageVersion/filename).');
+    }
+    return { packageId, packageVersion, filename };
+  }
+
+  private toValueSetKeyString(vsKey: ValueSetDeterministicKey): string {
+    return `${vsKey.packageId}#${vsKey.packageVersion}::${vsKey.filename}`;
+  }
+
+  private async resolveMetaCached(query: any): Promise<any> {
+    const key = this.stableStringify(query);
+    const existing = this.resolveMetaCache.get(key);
+    if (existing) return await existing;
+
+    const p = this.fpe.resolveMeta(query);
+    this.resolveMetaCache.set(key, p);
+    try {
+      return await p;
+    } catch (e) {
+      // Do not cache failures (resolution might succeed later if context changes).
+      this.resolveMetaCache.delete(key);
+      throw e;
+    }
+  }
+
   private async getValueSetMetadata(identifier: string, packageFilter?: FhirPackageIdentifier): Promise<FileIndexEntryWithPkg> {
+    const cacheKey = this.stableStringify({ identifier, packageFilter });
+    const cached = this.valueSetIdentifierMetaCache.get(cacheKey);
+    if (cached) return await cached;
+
+    const promise = this.getValueSetMetadataUncached(identifier, packageFilter);
+    this.valueSetIdentifierMetaCache.set(cacheKey, promise);
+    try {
+      return await promise;
+    } catch (e) {
+      // Don't cache failures
+      this.valueSetIdentifierMetaCache.delete(cacheKey);
+      throw e;
+    }
+  }
+
+  private async getValueSetMetadataUncached(identifier: string, packageFilter?: FhirPackageIdentifier): Promise<FileIndexEntryWithPkg> {
     const errors: any[] = [];
     if (identifier.startsWith('http:') || identifier.startsWith('https:') || identifier.includes(':')) {
       try {
-        const match = await this.fpe.resolveMeta({ resourceType: 'ValueSet', url: identifier, package: packageFilter });
+        const match = await this.resolveMetaCached({ resourceType: 'ValueSet', url: identifier, package: packageFilter });
         return match; // return the resolved match (with core-bias applied)
       } catch (e) {
         errors.push(e);
@@ -165,14 +259,14 @@ export class FhirTerminologyRuntime {
     }
     // Not a URL, or failed to resolve as URL - try and resolve it as ID
     try {
-      const match = await this.fpe.resolveMeta({ resourceType: 'ValueSet', id: identifier, package: packageFilter });
+      const match = await this.resolveMetaCached({ resourceType: 'ValueSet', id: identifier, package: packageFilter });
       return match; // return the resolved match (with core-bias applied)
     } catch (e) {
       errors.push(e);
     }
     // Couldn't resolve as ID - try and resolve it as name
     try {
-      const match = await this.fpe.resolveMeta({ resourceType: 'ValueSet', name: identifier, package: packageFilter });
+      const match = await this.resolveMetaCached({ resourceType: 'ValueSet', name: identifier, package: packageFilter });
       return match; // return the resolved match (with core-bias applied)
     } catch (e) {
       errors.push(e);
@@ -240,10 +334,10 @@ export class FhirTerminologyRuntime {
       // resolve referenced ValueSet metadata first within source package, then fallback globally
       let vsMeta: FileIndexEntryWithPkg;
       try {
-        vsMeta = await this.fpe.resolveMeta({ resourceType: 'ValueSet', url: vsUrl, package: sourcePackage });
+        vsMeta = await this.resolveMetaCached({ resourceType: 'ValueSet', url: vsUrl, package: sourcePackage });
       } catch {
         try {
-          vsMeta = await this.fpe.resolveMeta({ resourceType: 'ValueSet', url: vsUrl });
+          vsMeta = await this.resolveMetaCached({ resourceType: 'ValueSet', url: vsUrl });
         } catch {
           throw new Error(`Referenced ValueSet '${vsUrl}' not found (searched locally, then globally).`);
         }
@@ -536,14 +630,14 @@ export class FhirTerminologyRuntime {
       // resolveMeta will internally pick the best version match instead of returning multiples.
       let meta: any | undefined;
       try {
-        meta = await this.fpe.resolveMeta({ resourceType: 'CodeSystem', url, package: sourcePackage });
+        meta = await this.resolveMetaCached({ resourceType: 'CodeSystem', url, package: sourcePackage });
       } catch {
         // swallow and fallback to global resolution
       }
 
       if (!meta) {
         try {
-          meta = await this.fpe.resolveMeta({ resourceType: 'CodeSystem', url });
+          meta = await this.resolveMetaCached({ resourceType: 'CodeSystem', url });
         } catch {
           throw new Error(`CodeSystem '${url}' not found (searched in package '${sourcePackage.id}@${sourcePackage.version}' then globally).`);
         }
@@ -568,6 +662,220 @@ export class FhirTerminologyRuntime {
       throw this.prethrow(e);
     }
   }
+
+  /**
+   * Check whether a code (string) or Coding-like object is a member of a ValueSet.
+   * Optimized for the common case: code-only lookup against a small ValueSet.
+   */
+  public async inValueSet(
+    codeOrCoding: string | CodingLike,
+    valueSet: string | FileIndexEntryWithPkg,
+    packageFilter?: FhirPackageIdentifier
+  ): Promise<MembershipResult> {
+    const { code, system } = this.normalizeCodeOrCoding(codeOrCoding);
+    if (!code) return { status: 'not-member' };
+
+    let meta: FileIndexEntryWithPkg;
+    try {
+      meta = typeof valueSet === 'string' ? await this.getValueSetMetadata(valueSet, packageFilter) : valueSet;
+      if (!meta) return { status: 'unknown', reason: 'unknown-valueset' };
+    } catch {
+      return { status: 'unknown', reason: 'unknown-valueset' };
+    }
+
+    let vsKey: ValueSetDeterministicKey;
+    try {
+      vsKey = this.toValueSetDeterministicKey(meta);
+    } catch {
+      return { status: 'unknown', reason: 'unknown-valueset' };
+    }
+    const vsKeyStr = this.toValueSetKeyString(vsKey);
+
+    // Layer 1: small ValueSet index LRU
+    const smallIndex = this.smallValueSetIndexLru.get(vsKeyStr);
+    if (smallIndex) {
+      const result = this.lookupInIndex(smallIndex, code, system);
+      // Ensure external cache is kept up to date with what we know
+      await this.syncExternalCacheForLookup(vsKey, code, result);
+      return result;
+    }
+
+    // Layer 2: per-code membership LRU (for non-small ValueSets)
+    const membershipKey = system
+      ? `${vsKeyStr}|s:${system}|c:${code}`
+      : `${vsKeyStr}|c:${code}`;
+
+    const lruHit = this.membershipResultLru.get(membershipKey);
+    if (lruHit) return lruHit;
+
+    // Layer 3: external cache (optional)
+    const external = this.membershipCache;
+    if (external) {
+      try {
+        const entry = await external.getCode(vsKey, code);
+        if (entry) {
+          const result = this.membershipResultFromExternalEntry(entry, system);
+          this.membershipResultLru.set(membershipKey, result);
+          return result;
+        }
+      } catch {
+        // Ignore external cache failures and fall back to local evaluation.
+      }
+    }
+
+    // Local evaluation: expand ValueSet (may use expansion cache on disk)
+    let expansion: any;
+    try {
+      expansion = await this.expandValueSetByMeta(meta);
+      if (expansion?.expansion?.__failure) {
+        const res: MembershipResult = { status: 'unknown', reason: 'unexpandable-valueset' };
+        this.membershipResultLru.set(membershipKey, res);
+        return res;
+      }
+    } catch {
+      const res: MembershipResult = { status: 'unknown', reason: 'unexpandable-valueset' };
+      this.membershipResultLru.set(membershipKey, res);
+      return res;
+    }
+
+    const containsFlat = flattenExpansionContains(expansion?.expansion?.contains);
+    const index = buildIndexFromContains(containsFlat);
+
+    // Promote to small index if under threshold
+    if (index.uniqueCodeCount < 50) {
+      this.smallValueSetIndexLru.set(vsKeyStr, index);
+      // Small: also prime external cache for completeness
+      await this.primeExternalCacheIfProvided(vsKey, vsKeyStr, index, true);
+      const result = this.lookupInIndex(index, code, system);
+      return result;
+    }
+
+    // Large: optionally prime external cache once per VS
+    await this.primeExternalCacheIfProvided(vsKey, vsKeyStr, index, false);
+
+    const result = this.lookupInIndex(index, code, system);
+    this.membershipResultLru.set(membershipKey, result);
+    await this.syncExternalCacheForLookup(vsKey, code, result);
+    return result;
+  }
+
+  private normalizeCodeOrCoding(codeOrCoding: string | CodingLike): { code: string; system?: string } {
+    if (typeof codeOrCoding === 'string') {
+      return { code: codeOrCoding };
+    }
+    const code = (codeOrCoding as any)?.code;
+    const system = (codeOrCoding as any)?.system;
+    return {
+      code: typeof code === 'string' ? code : '',
+      system: typeof system === 'string' && system.length > 0 ? system : undefined
+    };
+  }
+
+  private lookupInIndex(index: SmallValueSetIndex, code: string, system?: string): MembershipResult {
+    const systemsMap = index.byCode.get(code);
+    if (!systemsMap) return { status: 'not-member' };
+
+    // If system specified, disambiguate
+    if (system) {
+      const concept = systemsMap.get(system);
+      if (!concept) return { status: 'not-member' };
+      return { status: 'member', concept };
+    }
+
+    // code-only: if multiple systems for this code, it's ambiguous
+    if (systemsMap.size > 1) {
+      return { status: 'unknown', reason: 'duplicate-code' };
+    }
+
+    const concept = systemsMap.values().next().value as ConceptProps | undefined;
+    if (!concept) return { status: 'not-member' };
+    return { status: 'member', concept };
+  }
+
+  private membershipResultFromExternalEntry(entry: MembershipCacheEntry, system?: string): MembershipResult {
+    if (entry.status === 'not-member') return { status: 'not-member' };
+    const conceptsBySystem = entry.conceptsBySystem || {};
+    const systems = Object.keys(conceptsBySystem);
+    if (system) {
+      const concept = conceptsBySystem[system];
+      return concept ? { status: 'member', concept } : { status: 'not-member' };
+    }
+    if (systems.length === 0) return { status: 'not-member' };
+    if (systems.length > 1) return { status: 'unknown', reason: 'duplicate-code' };
+    return { status: 'member', concept: conceptsBySystem[systems[0]] };
+  }
+
+  private async syncExternalCacheForLookup(vsKey: ValueSetDeterministicKey, code: string, result: MembershipResult): Promise<void> {
+    const external = this.membershipCache;
+    if (!external) return;
+    try {
+      if (result.status === 'member') {
+        const entry: MembershipCacheEntry = { status: 'member', conceptsBySystem: { [result.concept.system]: result.concept } };
+        await external.setCode(vsKey, code, entry);
+      } else if (result.status === 'not-member') {
+        const entry: MembershipCacheEntry = { status: 'not-member' };
+        await external.setCode(vsKey, code, entry);
+      } else {
+        // unknown reasons aren't persisted in external cache (keeps external storage simple)
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  private async primeExternalCacheIfProvided(
+    vsKey: ValueSetDeterministicKey,
+    vsKeyStr: string,
+    index: SmallValueSetIndex,
+    isSmall: boolean
+  ): Promise<void> {
+    const external = this.membershipCache;
+    if (!external) return;
+
+    // If external cache can track priming state, consult it; otherwise use in-memory guard.
+    try {
+      if (external.isValueSetPrimed) {
+        const primed = await external.isValueSetPrimed(vsKey);
+        if (primed) return;
+      } else {
+        if (this.externallyPrimedValueSets.has(vsKeyStr)) return;
+      }
+    } catch {
+      // If external can't answer, fall back to in-memory guard.
+      if (this.externallyPrimedValueSets.has(vsKeyStr)) return;
+    }
+
+    // Spec: only prime large ValueSets on first validation.
+    // For small ValueSets, we still prime for completeness/backups (cheap).
+    if (!isSmall) {
+      // OK to prime here (we already had to expand locally once).
+    }
+
+    const entries: Array<[string, MembershipCacheEntry]> = [];
+    for (const [code, systemsMap] of index.byCode.entries()) {
+      const conceptsBySystem: Record<string, ConceptProps> = {};
+      for (const [sys, concept] of systemsMap.entries()) {
+        conceptsBySystem[sys] = concept;
+      }
+      entries.push([code, { status: 'member', conceptsBySystem }]);
+    }
+
+    try {
+      if (external.bulkSetCodes) {
+        await external.bulkSetCodes(vsKey, entries);
+      } else {
+        for (const [code, entry] of entries) {
+          await external.setCode(vsKey, code, entry);
+        }
+      }
+      if (external.markValueSetPrimed) {
+        await external.markValueSetPrimed(vsKey);
+      }
+      this.externallyPrimedValueSets.add(vsKeyStr);
+    } catch {
+      // ignore external priming failures
+    }
+  }
 };
 
 export type {
@@ -575,8 +883,86 @@ export type {
   TerminologyRuntimeConfig,
   Prethrower,
   CountResult,
-  UnknownReason
+  UnknownReason,
+  MembershipResult,
+  ConceptProps,
+  CodingLike,
+  TerminologyMembershipCache,
+  ValueSetDeterministicKey,
+  MembershipCacheEntry
 } from '../types';
 
 // Export implicit code systems for external usage
 export { ImplicitCodeSystemRegistry } from './utils';
+
+type SmallValueSetIndex = {
+  byCode: Map<string, Map<string, ConceptProps>>;
+  uniqueCodeCount: number;
+};
+
+class LruCache<K, V> {
+  private maxSize: number;
+  private map: Map<K, V>;
+
+  constructor(maxSize: number) {
+    this.maxSize = Math.max(1, maxSize);
+    this.map = new Map();
+  }
+
+  get(key: K): V | undefined {
+    const value = this.map.get(key);
+    if (value === undefined) return undefined;
+    // refresh recency
+    this.map.delete(key);
+    this.map.set(key, value);
+    return value;
+  }
+
+  set(key: K, value: V): void {
+    if (this.map.has(key)) this.map.delete(key);
+    this.map.set(key, value);
+    if (this.map.size > this.maxSize) {
+      const oldestKey = this.map.keys().next().value as K | undefined;
+      if (oldestKey !== undefined) this.map.delete(oldestKey);
+    }
+  }
+}
+
+function flattenExpansionContains(contains: any[] | undefined): Array<{ system?: string; code?: string; display?: string; version?: string }> {
+  const out: Array<{ system?: string; code?: string; display?: string; version?: string }> = [];
+  const walk = (list: any[] | undefined) => {
+    if (!Array.isArray(list)) return;
+    for (const item of list) {
+      if (item && typeof item.code === 'string') {
+        const flattened: any = { system: item.system, code: item.code };
+        if ('display' in item) flattened.display = item.display;
+        if ('version' in item) flattened.version = item.version;
+        out.push(flattened);
+      }
+      if (Array.isArray(item?.contains)) walk(item.contains);
+    }
+  };
+  walk(contains);
+  return out;
+}
+
+function buildIndexFromContains(flat: Array<{ system?: string; code?: string; display?: string; version?: string }>): SmallValueSetIndex {
+  const byCode = new Map<string, Map<string, ConceptProps>>();
+  for (const item of flat) {
+    const code = typeof item.code === 'string' ? item.code : undefined;
+    const system = typeof item.system === 'string' ? item.system : undefined;
+    if (!code || !system) continue;
+    let systemsMap = byCode.get(code);
+    if (!systemsMap) {
+      systemsMap = new Map();
+      byCode.set(code, systemsMap);
+    }
+    if (!systemsMap.has(system)) {
+      const concept: ConceptProps = { system, code };
+      if ('display' in item && typeof item.display === 'string') concept.display = item.display;
+      if ('version' in item && typeof item.version === 'string') concept.version = item.version;
+      systemsMap.set(system, concept);
+    }
+  }
+  return { byCode, uniqueCodeCount: byCode.size };
+}
