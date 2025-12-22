@@ -227,17 +227,36 @@ FTR can translate codes using `ConceptMap` resources from FHIR packages.
 API:
 
 ```ts
-const targets = await ftr.translateConceptMap('A', 'some-conceptmap');
-// targets: Array<{ system, code, display?, version?, equivalence }>
+const result = await ftr.translateConceptMap('A', 'some-conceptmap');
+
+if (result.status === 'mapped') {
+  console.log(result.targets);
+} else {
+  console.log(result.reason);
+}
 ```
+
+Return type:
+
+- `mapped`: one or more targets were found
+- `unmapped`: no targets, with a reason
 
 Input:
 - A code string (common case; source `system` is implicit), or
 - A Coding-like object `{ system, code }`.
 
 Output:
-- Always returns an array of **full target Codings** (never just a string code).
-- Returns `[]` when there is no translation (or when a code-only lookup is ambiguous).
+- Returns a structured result object.
+- When `status === 'mapped'`, `targets` is an array of **full target Codings** (never just a string code).
+- When `status === 'unmapped'`, `reason` explains why no targets were returned.
+
+Unmapped reasons:
+- `no-source-code`: the source code is not present in the ConceptMap.
+- `no-translation`: the source code exists, but no translation exists for the requested source system (or the mapping is empty).
+- `unsupported-equivalence`: a mapping exists, but all targets were ignored because their `equivalence` values are unsupported. In this case, `ignoredEquivalences` is included.
+- `duplicate-code`: returned only for **code-only** lookups when the same code exists under **multiple source systems** in the ConceptMap.
+- `unknown-conceptmap`: the ConceptMap identifier could not be resolved or loaded.
+- `invalid-code`: the input code was empty.
 
 ### Equivalence handling
 
@@ -248,7 +267,6 @@ equivalent
 equal
 wider
 subsumes
-relatedto
 ```
 
 If `equivalence` is missing (allowed in FHIR R3), it is treated as `equivalent`.
@@ -295,12 +313,15 @@ type ConceptMapTranslation = {
   code: string;
   display?: string;
   version?: string;
-  equivalence: 'equivalent' | 'equal' | 'wider' | 'subsumes' | 'relatedto';
+  equivalence: 'equivalent' | 'equal' | 'wider' | 'subsumes';
 };
 
 type ConceptMapCacheEntry =
-  | { status: 'translated'; targetsBySourceSystem: Record<string, ConceptMapTranslation[]> }
-  | { status: 'no-translation' };
+  | {
+      status: 'found';
+      bySourceSystem: Record<string, { targets: ConceptMapTranslation[]; ignoredEquivalences?: string[] }>;
+    }
+  | { status: 'not-found' };
 
 interface TerminologyConceptMapCache {
   getCode(cm: ConceptMapDeterministicKey, code: string): Promise<ConceptMapCacheEntry | undefined>;
@@ -320,7 +341,7 @@ FTR supports two ways to track this state:
 
 1) **Automatic external primed-state (default; no extra methods required)**
 
-FTR automatically tracks whether a ValueSet has been primed in the external cache using the **same `getCode/setCode` methods you already implement**.
+FTR automatically tracks whether a ConceptMap has been primed in the external cache using the **same `getCode/setCode` methods you already implement**.
 
 Concretely:
 - After a successful prime, FTR writes a reserved **sentinel entry** under a reserved “code” key.
