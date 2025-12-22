@@ -820,7 +820,7 @@ export class FhirTerminologyRuntime {
     if (smallIndex) {
       const result = this.lookupInIndex(smallIndex, code, system);
       // Ensure external cache is kept up to date with what we know
-      await this.syncExternalCacheForLookup(vsKey, code, result);
+      await this.syncExternalMembershipCacheForLookup(vsKey, code, result);
       return result;
     }
 
@@ -864,17 +864,17 @@ export class FhirTerminologyRuntime {
     if (index.uniqueCodeCount <= FTR_DEFAULT_LIMITS.valueSet.smallThresholdUniqueCodes) {
       this.smallValueSetIndexLru.set(vsKeyStr, index);
       // Small: also prime external cache for completeness
-      await this.primeExternalCacheIfProvided(vsKey, vsKeyStr, index, true);
+      await this.primeExternalMembershipCacheIfProvided(vsKey, vsKeyStr, index, true);
       const result = this.lookupInIndex(index, code, system);
       return result;
     }
 
     // Large: optionally prime external cache once per VS
-    await this.primeExternalCacheIfProvided(vsKey, vsKeyStr, index, false);
+    await this.primeExternalMembershipCacheIfProvided(vsKey, vsKeyStr, index, false);
 
     const result = this.lookupInIndex(index, code, system);
     this.membershipResultLru.set(membershipKey, result);
-    await this.syncExternalCacheForLookup(vsKey, code, result);
+    await this.syncExternalMembershipCacheForLookup(vsKey, code, result);
     return result;
   }
 
@@ -924,7 +924,7 @@ export class FhirTerminologyRuntime {
     return { status: 'member', concept: conceptsBySystem[systems[0]] };
   }
 
-  private async syncExternalCacheForLookup(vsKey: ValueSetDeterministicKey, code: string, result: MembershipResult): Promise<void> {
+  private async syncExternalMembershipCacheForLookup(vsKey: ValueSetDeterministicKey, code: string, result: MembershipResult): Promise<void> {
     const external = this.membershipCache;
     if (!external) return;
     try {
@@ -943,7 +943,7 @@ export class FhirTerminologyRuntime {
     }
   }
 
-  private async primeExternalCacheIfProvided(
+  private async primeExternalMembershipCacheIfProvided(
     vsKey: ValueSetDeterministicKey,
     vsKeyStr: string,
     index: SmallValueSetIndex,
