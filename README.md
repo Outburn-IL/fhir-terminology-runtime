@@ -165,14 +165,102 @@ interface TerminologyMembershipCache {
 
   // Optional: more efficient priming for large ValueSets
   bulkSetCodes?(vs: ValueSetDeterministicKey, entries: Array<[string, MembershipCacheEntry]>): Promise<void>;
-  isValueSetPrimed?(vs: ValueSetDeterministicKey): Promise<boolean>;
-  markValueSetPrimed?(vs: ValueSetDeterministicKey): Promise<void>;
 }
 ```
 
-Priming behavior:
-- When a ValueSet is **small**, `inValueSet` may populate the external cache for completeness.
-- When a ValueSet is **large**, `inValueSet` will populate/prime the external cache the first time a code is checked against that ValueSet.
+### What does “prime / priming” mean?
+
+In this codebase, **priming** refers specifically to the optional *external membership cache* behavior.
+
+When FTR says it will **prime** the external cache for a ValueSet, it means:
+- FTR has already built a local membership index for that ValueSet (from its expansion).
+- FTR then **bulk-populates the external cache** with *membership answers for many (often all) codes* in that ValueSet, so future `inValueSet(...)` calls can be answered without re-expanding/re-indexing.
+
+This is different from the normal per-lookup caching that happens during `inValueSet`:
+- **Per-lookup cache sync** (always small): after answering a single code lookup, FTR may write a single `(ValueSetKey, code) -> entry` into the external cache.
+- **Priming** (larger write, optional): FTR writes *many* codes for the same ValueSet in one go (ideally via `bulkSetCodes`).
+
+#### Why prime at all?
+
+Priming is a performance / distribution optimization:
+- Speeds up future lookups for the same ValueSet (especially in fresh processes/containers).
+- Enables sharing membership knowledge across workers if the external cache is shared (Redis, DB, etc.).
+- Reduces repeated “first time” cost where the runtime would otherwise need to expand and index again.
+
+#### What exactly gets written during priming?
+
+Priming writes entries shaped like `MembershipCacheEntry`:
+
+- For each `code` in the ValueSet, FTR writes:
+  - `{ status: 'member', conceptsBySystem: { [systemUrl]: { system, code, display?, version? }, ... } }`
+
+Notes:
+- The external cache entry can store **multiple systems** for the same `code`. This is important because `inValueSet('X', vs)` can be ambiguous when multiple systems contain the same code.
+- FTR does **not** write "unknown" results to the external cache (for example `duplicate-code`), because unknown results often depend on whether the caller provided a system. Instead, FTR stores the raw “member by system(s)” facts.
+
+#### When does priming happen?
+
+Priming happens inside `inValueSet(...)` after FTR has built a local index for that ValueSet.
+
+Current behavior:
+- **Small ValueSets (≤ 50 unique codes)**:
+  - FTR builds an in-memory “small index”.
+  - FTR also primes the external cache “for completeness” because the write is cheap.
+- **Large ValueSets (> 50 unique codes)**:
+  - FTR uses a per-code LRU for in-memory caching.
+  - FTR attempts a one-time priming for that ValueSet so subsequent lookups can hit the external cache.
+
+Important: priming is **best-effort**.
+- If the external cache is unavailable or throws, FTR continues and still answers the lookup from local evaluation.
+- Priming failures do not make `inValueSet` fail.
+
+#### What does “primed” mean?
+
+“Primed” is a state meaning: *“we believe the external cache already contains the bulk membership entries for this ValueSet key.”*
+
+FTR supports two ways to track this state:
+
+1) **Automatic external primed-state (default; no extra methods required)**
+
+FTR automatically tracks whether a ValueSet has been primed in the external cache using the **same `getCode/setCode` methods you already implement**.
+
+Concretely:
+- After a successful prime, FTR writes a reserved **sentinel entry** under a reserved “code” key.
+- Before priming, FTR checks whether that sentinel entry exists.
+
+This means the “standard cache interface” is just `getCode`/`setCode` (and optionally `bulkSetCodes`). You do **not** need to implement any additional primed-state methods.
+
+What you might see in your cache:
+- FTR may store an extra entry with `code = '__ftr__primed__'` to represent “this ValueSet has been primed”.
+- This entry is internal bookkeeping and is never used as a real terminology code lookup.
+
+Collision note (extremely unlikely): if a ValueSet legitimately contains the code `'__ftr__primed__'`, FTR will avoid using the sentinel mechanism for that ValueSet and will fall back to in-memory priming guards.
+
+2) **In-memory primed-state (fallback)**
+
+If the external cache is unavailable (or throws), FTR uses an in-memory Set (one per process) to avoid re-priming repeatedly within the same runtime instance.
+
+This distinction matters:
+- The in-memory guard prevents repeated priming *only within the current process*.
+- The external primed-state prevents repeated priming across processes and restarts.
+
+#### A concrete mental model
+
+Consider a large ValueSet `VS` and a code lookup `inValueSet('C10', VS)`:
+
+1) FTR tries the in-memory LRUs.
+2) If configured, FTR tries the external cache for `(VS-key, 'C10')`.
+3) If not found, FTR expands/indexes locally, answers the lookup, and then:
+   - **syncs** the single code result to the external cache, and
+   - may **prime** the external cache for `VS` (bulk write) so future codes (`C11`, `C12`, …) can be served externally.
+
+#### Priming is not ValueSet expansion caching
+
+FTR has two separate caching concepts:
+- **Expansion caching**: stores the expanded ValueSet JSON on disk under `.ftr/` alongside packages.
+- **Membership caching**: accelerates `inValueSet` lookups (in-memory LRUs + optional external cache).
+
+“Priming” only refers to the **external membership cache** behavior.
 
 ## ValueSet Expansion Details
 

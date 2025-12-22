@@ -99,8 +99,6 @@ export interface TerminologyMembershipCache {
   setCode(vs: ValueSetDeterministicKey, code: string, entry: MembershipCacheEntry): Promise<void>;
 
   bulkSetCodes?(vs: ValueSetDeterministicKey, entries: Array<[string, MembershipCacheEntry]>): Promise<void>;
-  isValueSetPrimed?(vs: ValueSetDeterministicKey): Promise<boolean>;
-  markValueSetPrimed?(vs: ValueSetDeterministicKey): Promise<void>;
 }
 
 export type CountResult =

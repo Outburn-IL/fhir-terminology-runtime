@@ -42,6 +42,10 @@ import type {
 
 const versionedCacheDir = `v${ftrVersion.split('.').slice(0, 2).join('.')}.x`;
 
+// Reserved pseudo-code used as a sentinel to mark that a ValueSet has been externally "primed".
+// This is only written/read via the external membership cache and is never used for real membership queries.
+const EXTERNAL_PRIMED_SENTINEL_CODE = '__ftr__primed__';
+
 export class FhirTerminologyRuntime {
   private fpe: FhirPackageExplorer;
   private logger: Logger;
@@ -838,15 +842,20 @@ export class FhirTerminologyRuntime {
     const external = this.membershipCache;
     if (!external) return;
 
-    // If external cache can track priming state, consult it; otherwise use in-memory guard.
+    const canUseSentinel = !index.byCode.has(EXTERNAL_PRIMED_SENTINEL_CODE);
+
+    // Always consult the in-memory guard first (fast path).
+    if (this.externallyPrimedValueSets.has(vsKeyStr)) return;
+
+    // Consult a sentinel entry via getCode/setCode to detect whether this ValueSet was already primed.
     try {
-      if (external.isValueSetPrimed) {
-        const primed = await external.isValueSetPrimed(vsKey);
-        if (primed) return;
-      } else {
-        if (this.externallyPrimedValueSets.has(vsKeyStr)) return;
+      if (canUseSentinel) {
+        const sentinel = await external.getCode(vsKey, EXTERNAL_PRIMED_SENTINEL_CODE);
+        if (sentinel) {
+          this.externallyPrimedValueSets.add(vsKeyStr);
+          return;
+        }
       }
-    /* c8 ignore next */
     } catch {
       // If external can't answer, fall back to in-memory guard.
       if (this.externallyPrimedValueSets.has(vsKeyStr)) return;
@@ -879,7 +888,11 @@ export class FhirTerminologyRuntime {
         await external.markValueSetPrimed(vsKey);
       }
       this.externallyPrimedValueSets.add(vsKeyStr);
-    /* c8 ignore next */
+
+      // Mark primed state (best-effort) by writing the sentinel entry.
+      if (canUseSentinel) {
+        await external.setCode(vsKey, EXTERNAL_PRIMED_SENTINEL_CODE, { status: 'not-member' });
+      }
     } catch {
       // ignore external priming failures
     }
