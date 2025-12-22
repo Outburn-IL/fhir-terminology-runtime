@@ -89,8 +89,7 @@ export type SupportedConceptMapEquivalence =
   | 'equivalent'
   | 'equal'
   | 'wider'
-  | 'subsumes'
-  | 'relatedto';
+  | 'subsumes';
 
 /**
  * A translation target Coding plus metadata.

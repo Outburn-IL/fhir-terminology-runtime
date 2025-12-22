@@ -68,8 +68,7 @@ const SUPPORTED_CONCEPTMAP_EQUIVALENCE: ReadonlySet<SupportedConceptMapEquivalen
   'equivalent',
   'equal',
   'wider',
-  'subsumes',
-  'relatedto'
+  'subsumes'
 ]);
 
 export class FhirTerminologyRuntime {
