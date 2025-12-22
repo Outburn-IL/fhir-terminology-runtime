@@ -69,6 +69,27 @@ const expansion = await ftr.expandValueSet('administrative-gender'); // id | nam
 
 The `expandValueSet` method accepts any FSH-style identifier: canonical URL, id or name. It also accepts a resolved metadata object if you already have one.
 
+### 3. Get ValueSet Expansion Count
+
+Get the count of concepts in a ValueSet expansion without loading the full expansion if possible. Results are cached in memory.
+
+```ts
+const result = await ftr.getValueSetExpansionCount('administrative-gender');
+
+if (result.status === 'ok') {
+  console.log(`Count: ${result.count}`);
+} else {
+  console.log(`Could not count: ${result.reason}`);
+}
+```
+
+The result type is:
+```ts
+type CountResult =
+  | { status: 'ok'; count: number }
+  | { status: 'unknown'; reason: 'unexpandable-valueset' | 'unknown-valueset' };
+```
+
 ## ValueSet Expansion Details
 
 The expansion engine performs a deterministic local expansion when possible:
