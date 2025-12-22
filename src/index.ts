@@ -484,7 +484,12 @@ export class FhirTerminologyRuntime {
       // No usable fallback expansion. Cache a stub marking failure to avoid repeated expensive retries.
       if (this.cacheMode !== 'none') {
         const failureStub = { ...vs, expansion: { timestamp: new Date().toISOString(), __failure: true } };
-        try { await this.saveExpansionToCache(filename, packageId, packageVersion!, failureStub); } catch { /* ignore */ }
+        try {
+          await this.saveExpansionToCache(filename, packageId, packageVersion!, failureStub);
+        /* c8 ignore next */
+        } catch {
+          /* ignore */
+        }
       }
       throw e;
     }
@@ -818,6 +823,7 @@ export class FhirTerminologyRuntime {
       } else {
         // unknown reasons aren't persisted in external cache (keeps external storage simple)
       }
+    /* c8 ignore next */
     } catch {
       // ignore
     }
@@ -840,6 +846,7 @@ export class FhirTerminologyRuntime {
       } else {
         if (this.externallyPrimedValueSets.has(vsKeyStr)) return;
       }
+    /* c8 ignore next */
     } catch {
       // If external can't answer, fall back to in-memory guard.
       if (this.externallyPrimedValueSets.has(vsKeyStr)) return;
@@ -872,6 +879,7 @@ export class FhirTerminologyRuntime {
         await external.markValueSetPrimed(vsKey);
       }
       this.externallyPrimedValueSets.add(vsKeyStr);
+    /* c8 ignore next */
     } catch {
       // ignore external priming failures
     }
