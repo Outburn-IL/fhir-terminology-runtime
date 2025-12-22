@@ -3,7 +3,6 @@ import { FhirTerminologyRuntime } from '../src/index';
 
 describe('inValueSet (unit)', () => {
   let ftr: FhirTerminologyRuntime;
-  let externalPrimedCount = 0;
   let externalBulkCount = 0;
   let externalStore: Map<string, any>;
 
@@ -89,6 +88,21 @@ describe('inValueSet (unit)', () => {
         ]
       }
     }
+    ,
+    // Unexpandable: contains an unsupported filter and has no provided expansion fallback.
+    'vs-unexpandable.json': {
+      resourceType: 'ValueSet',
+      id: 'vs-unexpandable',
+      url: 'http://example.org/ValueSet/vs-unexpandable',
+      compose: {
+        include: [
+          {
+            system: 'http://example.org/system/unexpandable',
+            filter: [{ property: 'code', op: '=', value: 'ignored' }]
+          }
+        ]
+      }
+    }
   };
 
   const metaByIdentifier: Record<string, any> = {
@@ -96,7 +110,8 @@ describe('inValueSet (unit)', () => {
     'http://example.org/ValueSet/vs-small': { resourceType: 'ValueSet', filename: 'vs-small.json', __packageId: pkg.id, __packageVersion: pkg.version },
     'vs-dup': { resourceType: 'ValueSet', filename: 'vs-dup.json', __packageId: pkg.id, __packageVersion: pkg.version },
     'vs-large': { resourceType: 'ValueSet', filename: 'vs-large.json', __packageId: pkg.id, __packageVersion: pkg.version },
-    'vs-nested': { resourceType: 'ValueSet', filename: 'vs-nested.json', __packageId: pkg.id, __packageVersion: pkg.version }
+    'vs-nested': { resourceType: 'ValueSet', filename: 'vs-nested.json', __packageId: pkg.id, __packageVersion: pkg.version },
+    'vs-unexpandable': { resourceType: 'ValueSet', filename: 'vs-unexpandable.json', __packageId: pkg.id, __packageVersion: pkg.version }
   };
 
   beforeAll(async () => {
@@ -104,7 +119,6 @@ describe('inValueSet (unit)', () => {
     // We deliberately keep ValueSets expandable without CodeSystem resolution by including display in concepts.
 
     externalStore = new Map<string, any>();
-    const externalPrimed = new Set<string>();
 
     const membershipCache = {
       async getCode(vs: any, code: string) {
@@ -118,13 +132,6 @@ describe('inValueSet (unit)', () => {
         for (const [code, entry] of entries) {
           externalStore.set(`${vs.packageId}#${vs.packageVersion}::${vs.filename}|${code}`, entry);
         }
-      },
-      async isValueSetPrimed(vs: any) {
-        return externalPrimed.has(`${vs.packageId}#${vs.packageVersion}::${vs.filename}`);
-      },
-      async markValueSetPrimed(vs: any) {
-        externalPrimedCount += 1;
-        externalPrimed.add(`${vs.packageId}#${vs.packageVersion}::${vs.filename}`);
       }
     };
 
@@ -202,7 +209,9 @@ describe('inValueSet (unit)', () => {
     const res = await ftr.inValueSet('C10', 'vs-large');
     expect(res.status).toBe('member');
     expect(externalBulkCount).toBeGreaterThanOrEqual(1);
-    expect(externalPrimedCount).toBeGreaterThanOrEqual(1);
+    // sentinel marker should exist after priming
+    const pkgKey = `${pkg.id}#${pkg.version}::vs-large.json|__ftr__primed__`;
+    expect(externalStore.has(pkgKey)).toBe(true);
   });
 
   it('falls back to provided expansion and handles nested contains', async () => {
@@ -214,6 +223,11 @@ describe('inValueSet (unit)', () => {
       expect(res.concept.display).toBe('Child');
       expect(res.concept.version).toBe('1');
     }
+  });
+
+  it('returns unexpandable-valueset when expansion fails and no fallback expansion exists', async () => {
+    const res = await ftr.inValueSet('ANY', 'vs-unexpandable');
+    expect(res).toEqual({ status: 'unknown', reason: 'unexpandable-valueset' });
   });
 });
 
@@ -375,7 +389,7 @@ describe('inValueSet (unit) - cache and priming branches', () => {
       async setCode() {
         setCodeCalls += 1;
       }
-      // intentionally omit bulkSetCodes/isValueSetPrimed/markValueSetPrimed
+      // intentionally omit bulkSetCodes (forces per-code priming)
     };
 
     const ftr = await FhirTerminologyRuntime.create({
@@ -387,13 +401,13 @@ describe('inValueSet (unit) - cache and priming branches', () => {
 
     const first = await ftr.inValueSet('C10', 'vs-large');
     expect(first.status).toBe('member');
-    // 60 codes primed + 1 syncExternalCacheForLookup call
-    expect(setCodeCalls).toBe(61);
+    // 60 codes primed + 1 sentinel primed marker + 1 syncExternalCacheForLookup call
+    expect(setCodeCalls).toBe(62);
 
     const secondDifferentCode = await ftr.inValueSet('C11', 'vs-large');
     expect(secondDifferentCode.status).toBe('member');
     // Should not re-prime all codes again; only sync the requested code.
-    expect(setCodeCalls).toBe(62);
+    expect(setCodeCalls).toBe(63);
   });
 
   it('ignores external cache read failures and falls back to local evaluation', async () => {

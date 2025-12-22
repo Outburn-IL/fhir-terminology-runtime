@@ -48,8 +48,9 @@ describe('external membership cache helpers (unit)', () => {
   });
 
   it('primeExternalCacheIfProvided uses per-code setCode when bulkSetCodes is not available', async () => {
+    const getCode = vi.fn().mockResolvedValue(undefined);
     const setCode = vi.fn().mockResolvedValue(undefined);
-    const ftr = await makeFtr({ setCode });
+    const ftr = await makeFtr({ getCode, setCode });
 
     const vsKey = { packageId: 'p', packageVersion: '1.0.0', filename: 'vs.json' };
     const vsKeyStr = 'p#1.0.0::vs.json';
@@ -69,16 +70,17 @@ describe('external membership cache helpers (unit)', () => {
 
     await (ftr as any).primeExternalCacheIfProvided(vsKey, vsKeyStr, index, true);
 
-    expect(setCode).toHaveBeenCalledTimes(1);
+    // 1 membership entry + 1 sentinel primed marker
+    expect(setCode).toHaveBeenCalledTimes(2);
     expect((ftr as any).externallyPrimedValueSets.has(vsKeyStr)).toBe(true);
   });
 
   it('primeExternalCacheIfProvided returns early when external reports ValueSet is already primed', async () => {
+    const getCode = vi.fn().mockResolvedValue({ status: 'not-member' });
     const setCode = vi.fn().mockResolvedValue(undefined);
     const bulkSetCodes = vi.fn().mockResolvedValue(undefined);
-    const isValueSetPrimed = vi.fn().mockResolvedValue(true);
 
-    const ftr = await makeFtr({ setCode, bulkSetCodes, isValueSetPrimed });
+    const ftr = await makeFtr({ getCode, setCode, bulkSetCodes });
 
     const vsKey = { packageId: 'p', packageVersion: '1.0.0', filename: 'vs.json' };
     const vsKeyStr = 'p#1.0.0::vs.json';
@@ -90,18 +92,17 @@ describe('external membership cache helpers (unit)', () => {
 
     await (ftr as any).primeExternalCacheIfProvided(vsKey, vsKeyStr, index, true);
 
-    expect(isValueSetPrimed).toHaveBeenCalledWith(vsKey);
+    expect(getCode).toHaveBeenCalledTimes(1);
     expect(bulkSetCodes).not.toHaveBeenCalled();
     expect(setCode).not.toHaveBeenCalled();
   });
 
-  it('primeExternalCacheIfProvided calls bulkSetCodes and markValueSetPrimed when available', async () => {
+  it('primeExternalCacheIfProvided calls bulkSetCodes and writes sentinel marker', async () => {
+    const getCode = vi.fn().mockResolvedValue(undefined);
     const setCode = vi.fn().mockResolvedValue(undefined);
     const bulkSetCodes = vi.fn().mockResolvedValue(undefined);
-    const isValueSetPrimed = vi.fn().mockResolvedValue(false);
-    const markValueSetPrimed = vi.fn().mockResolvedValue(undefined);
 
-    const ftr = await makeFtr({ setCode, bulkSetCodes, isValueSetPrimed, markValueSetPrimed });
+    const ftr = await makeFtr({ getCode, setCode, bulkSetCodes });
 
     const vsKey = { packageId: 'p', packageVersion: '1.0.0', filename: 'vs.json' };
     const vsKeyStr = 'p#1.0.0::vs.json';
@@ -114,7 +115,56 @@ describe('external membership cache helpers (unit)', () => {
     await (ftr as any).primeExternalCacheIfProvided(vsKey, vsKeyStr, index, true);
 
     expect(bulkSetCodes).toHaveBeenCalledTimes(1);
-    expect(markValueSetPrimed).toHaveBeenCalledWith(vsKey);
+    expect(setCode).toHaveBeenCalledWith(vsKey, '__ftr__primed__', { status: 'not-member' });
     expect((ftr as any).externallyPrimedValueSets.has(vsKeyStr)).toBe(true);
+  });
+
+  it('primeExternalCacheIfProvided skips sentinel reads/writes when sentinel code collides with real code', async () => {
+    const getCode = vi.fn().mockResolvedValue(undefined);
+    const setCode = vi.fn().mockResolvedValue(undefined);
+    const bulkSetCodes = vi.fn().mockResolvedValue(undefined);
+
+    const ftr = await makeFtr({ getCode, setCode, bulkSetCodes });
+
+    const vsKey = { packageId: 'p', packageVersion: '1.0.0', filename: 'vs.json' };
+    const vsKeyStr = 'p#1.0.0::vs.json';
+
+    const index = {
+      uniqueCodeCount: 2,
+      byCode: new Map([
+        ['__ftr__primed__', new Map([['s1', { system: 's1', code: '__ftr__primed__' }]])],
+        ['A', new Map([['s1', { system: 's1', code: 'A' }]])]
+      ])
+    };
+
+    await (ftr as any).primeExternalCacheIfProvided(vsKey, vsKeyStr, index, true);
+
+    // canUseSentinel=false -> should not consult external.getCode for sentinel
+    expect(getCode).not.toHaveBeenCalled();
+    expect(bulkSetCodes).toHaveBeenCalledTimes(1);
+    // bulk path -> no per-code setCode and no sentinel marker write
+    expect(setCode).not.toHaveBeenCalled();
+  });
+
+  it('primeExternalCacheIfProvided uses in-memory guard on subsequent calls', async () => {
+    const getCode = vi.fn().mockResolvedValue(undefined);
+    const setCode = vi.fn().mockResolvedValue(undefined);
+    const bulkSetCodes = vi.fn().mockResolvedValue(undefined);
+
+    const ftr = await makeFtr({ getCode, setCode, bulkSetCodes });
+
+    const vsKey = { packageId: 'p', packageVersion: '1.0.0', filename: 'vs.json' };
+    const vsKeyStr = 'p#1.0.0::vs.json';
+
+    const index = {
+      uniqueCodeCount: 1,
+      byCode: new Map([['A', new Map([['s1', { system: 's1', code: 'A' }]])]])
+    };
+
+    await (ftr as any).primeExternalCacheIfProvided(vsKey, vsKeyStr, index, true);
+    await (ftr as any).primeExternalCacheIfProvided(vsKey, vsKeyStr, index, true);
+
+    // Second call should return early via externallyPrimedValueSets
+    expect(bulkSetCodes).toHaveBeenCalledTimes(1);
   });
 });

@@ -73,11 +73,6 @@ class Bcp47LanguageCodesProvider implements ImplicitCodeSystemProvider {
         const normalizedCode = this.normalizeBcp47Code(code);
         this.conceptsCache.set(normalizedCode, display);
         
-        // Also accept the original case for compatibility
-        if (normalizedCode !== code) {
-          this.conceptsCache.set(code, display);
-        }
-        
         // Accept underscore variants (e.g., en_US for en-US) for compatibility
         if (code.includes('-')) {
           const underscoreVariant = code.replace(/-/g, '_');

@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 // Important: avoid importing ../src/index at top-level from other tests’ module cache.
 // This file doesn't mock modules, so a normal import is fine.
 import { FhirTerminologyRuntime } from '../src/index';
+import { ImplicitCodeSystemRegistry } from '../src/utils/terminology/implicitCodeSystems';
 
 describe('expandValueSet / expandInclude branching (unit)', () => {
   const pkg = { id: 'test.pkg', version: '1.0.0' };
@@ -202,5 +203,133 @@ describe('expandValueSet / expandInclude branching (unit)', () => {
 
     await expect(ftr.expandValueSet('urn:test:missing')).rejects.toThrow('Failed to resolve ValueSet');
     expect(errorLogger.error).toHaveBeenCalled();
+  });
+
+  it('uses implicit CodeSystem to backfill missing displays when CodeSystem lookup fails (hasConcepts)', async () => {
+    const systemUrl = 'urn:iso:std:iso:3166';
+
+    const valueSets: Record<string, any> = {
+      'vs-missing-display.json': {
+        resourceType: 'ValueSet',
+        id: 'vs-missing-display',
+        url: 'http://example.org/ValueSet/vs-missing-display',
+        compose: {
+          include: [
+            {
+              system: systemUrl,
+              concept: [{ code: 'US' }] // missing display -> forces needsCsLookup
+            }
+          ]
+        }
+      }
+    };
+
+    const metaBy: Record<string, any> = {
+      'vs-missing-display': {
+        resourceType: 'ValueSet',
+        filename: 'vs-missing-display.json',
+        __packageId: pkg.id,
+        __packageVersion: pkg.version
+      }
+    };
+
+    const infoLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const fpe: any = makeFpeStub(valueSets, metaBy);
+    const ftr = await FhirTerminologyRuntime.create({ fpe, cacheMode: 'none', fhirVersion: '4.0.1', logger: infoLogger as any });
+
+    (ftr as any).resolveCompleteCodeSystem = async () => {
+      throw new Error('boom');
+    };
+
+    const originalGetConcepts = ImplicitCodeSystemRegistry.getConcepts;
+    (ImplicitCodeSystemRegistry as any).getConcepts = (canonicalUrl: string) => {
+      if (canonicalUrl !== systemUrl) return undefined;
+      return new Map<string, string | undefined>([['US', 'United States']]);
+    };
+
+    try {
+      const expansion = await ftr.expandValueSet('vs-missing-display');
+      expect(expansion.expansion.total).toBe(1);
+      expect(expansion.expansion.contains).toEqual(
+        expect.arrayContaining([expect.objectContaining({ system: systemUrl, code: 'US', display: 'United States' })])
+      );
+      expect(infoLogger.info).toHaveBeenCalled();
+    } finally {
+      (ImplicitCodeSystemRegistry as any).getConcepts = originalGetConcepts;
+    }
+  });
+
+  it('backfills missing displays from a resolved complete CodeSystem (hasConcepts success path)', async () => {
+    const systemUrl = 'http://example.org/system/complete';
+
+    const valueSets: Record<string, any> = {
+      'vs-backfill-display.json': {
+        resourceType: 'ValueSet',
+        id: 'vs-backfill-display',
+        url: 'http://example.org/ValueSet/vs-backfill-display',
+        compose: {
+          include: [
+            {
+              system: systemUrl,
+              concept: [{ code: 'US' }] // missing display -> forces needsCsLookup
+            }
+          ]
+        }
+      }
+    };
+
+    const metaBy: Record<string, any> = {
+      'vs-backfill-display': {
+        resourceType: 'ValueSet',
+        filename: 'vs-backfill-display.json',
+        __packageId: pkg.id,
+        __packageVersion: pkg.version
+      }
+    };
+
+    const fpe: any = makeFpeStub(valueSets, metaBy);
+    const ftr = await FhirTerminologyRuntime.create({ fpe, cacheMode: 'none', fhirVersion: '4.0.1' });
+
+    (ftr as any).resolveCompleteCodeSystem = async () => {
+      return {
+        resourceType: 'CodeSystem',
+        url: systemUrl,
+        content: 'complete',
+        concept: [{ code: 'US', display: 'United States' }]
+      };
+    };
+
+    const expansion = await ftr.expandValueSet('vs-backfill-display');
+    expect(expansion.expansion.total).toBe(1);
+    expect(expansion.expansion.contains).toEqual(
+      expect.arrayContaining([expect.objectContaining({ system: systemUrl, code: 'US', display: 'United States' })])
+    );
+  });
+
+  it('throws when referenced ValueSet cannot be resolved locally or globally', async () => {
+    const valueSets: Record<string, any> = {
+      'vs-ref-missing.json': {
+        resourceType: 'ValueSet',
+        id: 'vs-ref-missing',
+        url: 'http://example.org/ValueSet/vs-ref-missing',
+        compose: {
+          include: [
+            {
+              valueSet: ['http://example.org/ValueSet/definitely-missing']
+            }
+          ]
+        }
+      }
+    };
+
+    const metaBy: Record<string, any> = {
+      'vs-ref-missing': { resourceType: 'ValueSet', filename: 'vs-ref-missing.json', __packageId: pkg.id, __packageVersion: pkg.version }
+      // NOTE: no entries for referenced VS (neither local nor global), so both resolveMetaCached calls fail.
+    };
+
+    const fpe: any = makeFpeStub(valueSets, metaBy);
+    const ftr = await FhirTerminologyRuntime.create({ fpe, cacheMode: 'none', fhirVersion: '4.0.1' });
+
+    await expect(ftr.expandValueSet('vs-ref-missing')).rejects.toThrow('Referenced ValueSet');
   });
 });

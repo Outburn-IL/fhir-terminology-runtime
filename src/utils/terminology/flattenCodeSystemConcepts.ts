@@ -5,6 +5,7 @@
 export function flattenCodeSystemConcepts(cs: any): Map<string, string | undefined> {
   const map = new Map<string, string | undefined>();
   const walk = (concepts: any[]) => {
+    /* c8 ignore next */
     if (!Array.isArray(concepts)) return;
     for (const c of concepts) {
       if (c && typeof c === 'object' && typeof c.code === 'string') {
