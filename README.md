@@ -218,6 +218,104 @@ Important: priming is **best-effort**.
 
 “Primed” is a state meaning: *“we believe the external cache already contains the bulk membership entries for this ValueSet key.”*
 
+---
+
+## ConceptMap translation (`translateConceptMap`)
+
+FTR can translate codes using `ConceptMap` resources from FHIR packages.
+
+API:
+
+```ts
+const targets = await ftr.translateConceptMap('A', 'some-conceptmap');
+// targets: Array<{ system, code, display?, version?, equivalence }>
+```
+
+Input:
+- A code string (common case; source `system` is implicit), or
+- A Coding-like object `{ system, code }`.
+
+Output:
+- Always returns an array of **full target Codings** (never just a string code).
+- Returns `[]` when there is no translation (or when a code-only lookup is ambiguous).
+
+### Equivalence handling
+
+Only these `ConceptMap.group.element.target[].equivalence` values are used for translation:
+
+```txt
+equivalent
+equal
+wider
+subsumes
+relatedto
+```
+
+If `equivalence` is missing (allowed in FHIR R3), it is treated as `equivalent`.
+Any other equivalence value is ignored.
+
+### Group flattening
+
+All `ConceptMap.group[]` entries are treated as a single flattened mapping.
+Group boundaries have no semantic meaning for translation in this runtime.
+
+### Translation caching (`conceptMapCache`)
+
+`translateConceptMap` uses multiple caching layers similar to `inValueSet`:
+
+- In-memory LRU for **small** ConceptMaps (≤ 50 unique source codes), holding up to 20 ConceptMaps.
+- In-memory LRU for **hot per-code** translation results, holding up to 1,000 lookups.
+- Optional **external async cache** (injectable) used for cold-start / distributed caching.
+
+Provide a `conceptMapCache` in `FhirTerminologyRuntime.create(...)`:
+
+```ts
+const ftr = await FhirTerminologyRuntime.create({
+  fpe,
+  cacheMode: 'lazy',
+  fhirVersion: '4.0.1',
+  conceptMapCache
+});
+```
+
+The external ConceptMap cache is keyed by a deterministic ConceptMap namespace:
+
+- Package ConceptMaps: `(packageId, packageVersion, filename)`
+- Server ConceptMaps: reserved for future support (keyed by server base URL + ConceptMap canonical URL)
+
+Interface (simplified):
+
+```ts
+type ConceptMapDeterministicKey =
+  | { kind: 'package'; packageId: string; packageVersion: string; filename: string }
+  | { kind: 'server'; serverBaseUrl: string; url: string };
+
+type ConceptMapTranslation = {
+  system: string;
+  code: string;
+  display?: string;
+  version?: string;
+  equivalence: 'equivalent' | 'equal' | 'wider' | 'subsumes' | 'relatedto';
+};
+
+type ConceptMapCacheEntry =
+  | { status: 'translated'; targetsBySourceSystem: Record<string, ConceptMapTranslation[]> }
+  | { status: 'no-translation' };
+
+interface TerminologyConceptMapCache {
+  getCode(cm: ConceptMapDeterministicKey, code: string): Promise<ConceptMapCacheEntry | undefined>;
+  setCode(cm: ConceptMapDeterministicKey, code: string, entry: ConceptMapCacheEntry): Promise<void>;
+
+  bulkSetCodes?(cm: ConceptMapDeterministicKey, entries: Array<[string, ConceptMapCacheEntry]>): Promise<void>;
+
+  // Required: used for future server-based reload operations
+  clearNamespace(cm: ConceptMapDeterministicKey): Promise<void>;
+}
+```
+
+Implementation note for cache authors:
+- Use a clear namespace prefix (for example `cm:pkg:` vs `cm:srv:`) so you can safely store both package-based and future server-based entries.
+
 FTR supports two ways to track this state:
 
 1) **Automatic external primed-state (default; no extra methods required)**

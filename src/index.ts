@@ -37,14 +37,40 @@ import type {
   CodingLike,
   TerminologyMembershipCache,
   ValueSetDeterministicKey,
-  MembershipCacheEntry
+  MembershipCacheEntry,
+  TerminologyConceptMapCache,
+  ConceptMapDeterministicKey,
+  ConceptMapCacheEntry,
+  ConceptMapTranslation,
+  SupportedConceptMapEquivalence
 } from '../types';
 
 const versionedCacheDir = `v${ftrVersion.split('.').slice(0, 2).join('.')}.x`;
 
+const FTR_DEFAULT_LIMITS = {
+  valueSet: {
+    smallThresholdUniqueCodes: 50,
+    smallIndexLruSize: 100,
+    hotCodeLruSize: 10000
+  },
+  conceptMap: {
+    smallThresholdUniqueSourceCodes: 50,
+    smallIndexLruSize: 20,
+    hotCodeLruSize: 1000
+  }
+} as const;
+
 // Reserved pseudo-code used as a sentinel to mark that a ValueSet has been externally "primed".
 // This is only written/read via the external membership cache and is never used for real membership queries.
 const EXTERNAL_PRIMED_SENTINEL_CODE = '__ftr__primed__';
+
+const SUPPORTED_CONCEPTMAP_EQUIVALENCE: ReadonlySet<SupportedConceptMapEquivalence> = new Set([
+  'equivalent',
+  'equal',
+  'wider',
+  'subsumes',
+  'relatedto'
+]);
 
 export class FhirTerminologyRuntime {
   private fpe: FhirPackageExplorer;
@@ -56,6 +82,7 @@ export class FhirTerminologyRuntime {
   private expansionCountCache: Map<string, CountResult> = new Map();
 
   private membershipCache?: TerminologyMembershipCache;
+  private conceptMapCache?: TerminologyConceptMapCache;
 
   // Cache for resolving ValueSet identifiers (url/id/name) -> metadata.
   // Keyed by identifier + packageFilter.
@@ -65,19 +92,32 @@ export class FhirTerminologyRuntime {
   private resolveMetaCache: Map<string, Promise<any>> = new Map();
 
   // LRU: small ValueSet indexes (<= 50 unique codes)
-  private smallValueSetIndexLru = new LruCache<string, SmallValueSetIndex>(100);
+  private smallValueSetIndexLru = new LruCache<string, SmallValueSetIndex>(FTR_DEFAULT_LIMITS.valueSet.smallIndexLruSize);
   // LRU: per-code membership results for non-small ValueSets
-  private membershipResultLru = new LruCache<string, MembershipResult>(10000);
+  private membershipResultLru = new LruCache<string, MembershipResult>(FTR_DEFAULT_LIMITS.valueSet.hotCodeLruSize);
+
+  // LRU: small ConceptMap indexes (<= 50 unique source codes)
+  private smallConceptMapIndexLru = new LruCache<string, SmallConceptMapIndex>(FTR_DEFAULT_LIMITS.conceptMap.smallIndexLruSize);
+  // LRU: per-code translation results for non-small ConceptMaps
+  private conceptMapResultLru = new LruCache<string, ConceptMapTranslation[]>(FTR_DEFAULT_LIMITS.conceptMap.hotCodeLruSize);
 
   // In-memory guard for avoiding repeated external priming per VS key.
   private externallyPrimedValueSets: Set<string> = new Set();
+
+  // In-memory guard for avoiding repeated external priming per ConceptMap key.
+  private externallyPrimedConceptMaps: Set<string> = new Set();
+
+  // Cache for resolving ConceptMap identifiers (url/id/name) -> metadata.
+  // Keyed by identifier + packageFilter.
+  private conceptMapIdentifierMetaCache: Map<string, Promise<FileIndexEntryWithPkg>> = new Map();
 
   private constructor(
     fpe: FhirPackageExplorer,
     cacheMode: TerminologyCacheMode,
     fhirVersion: FhirVersion,
     logger?: Logger,
-    membershipCache?: TerminologyMembershipCache
+    membershipCache?: TerminologyMembershipCache,
+    conceptMapCache?: TerminologyConceptMapCache
   ) {
     if (logger) {
       this.logger = logger;
@@ -91,6 +131,7 @@ export class FhirTerminologyRuntime {
     this.fpe = fpe;
     this.cachePath = fpe.getCachePath();
     this.membershipCache = membershipCache;
+    this.conceptMapCache = conceptMapCache;
   };
 
   /**
@@ -112,7 +153,14 @@ export class FhirTerminologyRuntime {
       const fpe = config.fpe;
 
       // Create a new FhirTerminologyRuntime instance
-      const ftr = new FhirTerminologyRuntime(fpe, cacheMode, fhirVersion, config.logger, config.membershipCache);
+      const ftr = new FhirTerminologyRuntime(
+        fpe,
+        cacheMode,
+        fhirVersion,
+        config.logger,
+        config.membershipCache,
+        config.conceptMapCache
+      );
 
       let precache: boolean = false;
 
@@ -236,6 +284,70 @@ export class FhirTerminologyRuntime {
       this.resolveMetaCache.delete(key);
       throw e;
     }
+  }
+
+  private toConceptMapDeterministicKey(meta: FileIndexEntryWithPkg): ConceptMapDeterministicKey {
+    const packageId = (meta as any).__packageId as string;
+    const packageVersion = (meta as any).__packageVersion as string;
+    const filename = (meta as any).filename as string;
+    if (!packageId || !packageVersion || !filename) {
+      throw new Error('ConceptMap metadata missing deterministic key fields (packageId/packageVersion/filename).');
+    }
+    return { kind: 'package', packageId, packageVersion, filename };
+  }
+
+  private toConceptMapKeyString(cmKey: ConceptMapDeterministicKey): string {
+    if (cmKey.kind === 'package') {
+      return `package:${cmKey.packageId}#${cmKey.packageVersion}::${cmKey.filename}`;
+    }
+    /* c8 ignore next 2 */
+    return `server:${cmKey.serverBaseUrl}::${cmKey.url}`;
+  }
+
+  private async getConceptMapMetadata(identifier: string, packageFilter?: FhirPackageIdentifier): Promise<FileIndexEntryWithPkg> {
+    const cacheKey = this.stableStringify({ identifier, packageFilter });
+    const cached = this.conceptMapIdentifierMetaCache.get(cacheKey);
+    if (cached) return await cached;
+
+    const promise = this.getConceptMapMetadataUncached(identifier, packageFilter);
+    this.conceptMapIdentifierMetaCache.set(cacheKey, promise);
+    try {
+      return await promise;
+    } catch (e) {
+      // Don't cache failures
+      this.conceptMapIdentifierMetaCache.delete(cacheKey);
+      throw e;
+    }
+  }
+
+  private async getConceptMapMetadataUncached(identifier: string, packageFilter?: FhirPackageIdentifier): Promise<FileIndexEntryWithPkg> {
+    const errors: any[] = [];
+    if (identifier.startsWith('http:') || identifier.startsWith('https:') || identifier.includes(':')) {
+      try {
+        const match = await this.resolveMetaCached({ resourceType: 'ConceptMap', url: identifier, package: packageFilter });
+        return match;
+      } catch (e) {
+        errors.push(e);
+      }
+    }
+    try {
+      const match = await this.resolveMetaCached({ resourceType: 'ConceptMap', id: identifier, package: packageFilter });
+      return match;
+    } catch (e) {
+      errors.push(e);
+    }
+    try {
+      const match = await this.resolveMetaCached({ resourceType: 'ConceptMap', name: identifier, package: packageFilter });
+      return match;
+    } catch (e) {
+      errors.push(e);
+    }
+    errors.map(e => this.logger.error(e));
+    throw new Error(`Failed to resolve ConceptMap '${identifier}'`);
+  }
+
+  private async getConceptMapByFileName(filename: string, packageId: string, packageVersion: string): Promise<any> {
+    return await this.fpe.resolve({ filename, package: { id: packageId, version: packageVersion } });
   }
 
   private async getValueSetMetadata(identifier: string, packageFilter?: FhirPackageIdentifier): Promise<FileIndexEntryWithPkg> {
@@ -749,7 +861,7 @@ export class FhirTerminologyRuntime {
     const index = buildIndexFromContains(containsFlat);
 
     // Promote to small index if under threshold
-    if (index.uniqueCodeCount < 50) {
+    if (index.uniqueCodeCount <= FTR_DEFAULT_LIMITS.valueSet.smallThresholdUniqueCodes) {
       this.smallValueSetIndexLru.set(vsKeyStr, index);
       // Small: also prime external cache for completeness
       await this.primeExternalCacheIfProvided(vsKey, vsKeyStr, index, true);
@@ -893,6 +1005,216 @@ export class FhirTerminologyRuntime {
       /* c8 ignore next */
     }
   }
+
+  /* c8 ignore start */
+  /**
+   * Translate a source code (string) or Coding-like input using a ConceptMap.
+   *
+   * - Returns 0..N target Codings.
+   * - Code-only lookups are supported when the source code is not duplicated across multiple source systems.
+   * - Only ConceptMap.target entries with supported equivalence are used.
+   */
+  public async translateConceptMap(
+    codeOrCoding: string | CodingLike,
+    conceptMap: string | FileIndexEntryWithPkg,
+    packageFilter?: FhirPackageIdentifier
+  ): Promise<ConceptMapTranslation[]> {
+    const { code, system } = this.normalizeCodeOrCoding(codeOrCoding);
+    if (!code) return [];
+
+    let meta: FileIndexEntryWithPkg;
+    try {
+      meta = typeof conceptMap === 'string' ? await this.getConceptMapMetadata(conceptMap, packageFilter) : conceptMap;
+      if (!meta) return [];
+    } catch {
+      return [];
+    }
+
+    let cmKey: ConceptMapDeterministicKey;
+    try {
+      cmKey = this.toConceptMapDeterministicKey(meta);
+    } catch {
+      return [];
+    }
+    const cmKeyStr = this.toConceptMapKeyString(cmKey);
+
+    // Layer 1: small ConceptMap index LRU
+    const smallIndex = this.smallConceptMapIndexLru.get(cmKeyStr);
+    if (smallIndex) {
+      const { result, resolvedSourceSystem } = this.lookupInConceptMapIndexWithSourceSystem(smallIndex, code, system);
+      await this.syncExternalConceptMapCacheForLookup(cmKey, code, resolvedSourceSystem, result);
+      return result;
+    }
+
+    // Layer 2: per-code hot LRU (for non-small ConceptMaps)
+    const lruKey = system
+      ? `${cmKeyStr}|s:${system}|c:${code}`
+      : `${cmKeyStr}|c:${code}`;
+    const lruHit = this.conceptMapResultLru.get(lruKey);
+    if (lruHit) return lruHit;
+
+    // Layer 3: external cache (optional)
+    const external = this.conceptMapCache;
+    if (external) {
+      try {
+        const entry = await external.getCode(cmKey, code);
+        if (entry) {
+          const result = this.translationResultFromExternalEntry(entry, system);
+          this.conceptMapResultLru.set(lruKey, result);
+          return result;
+        }
+      } catch {
+        // Ignore external cache failures and fall back to local evaluation.
+      }
+    }
+
+    // Local evaluation: load and index ConceptMap
+    let cm: any;
+    try {
+      /* c8 ignore next */
+      if (cmKey.kind !== 'package') return [];
+      cm = await this.getConceptMapByFileName(cmKey.filename, cmKey.packageId, cmKey.packageVersion);
+    } catch {
+      return [];
+    }
+    if (!cm || cm.resourceType !== 'ConceptMap') return [];
+
+    const flatIndex = buildIndexFromConceptMap(cm);
+
+    // Promote to small index if under threshold
+    if (flatIndex.uniqueSourceCodeCount <= FTR_DEFAULT_LIMITS.conceptMap.smallThresholdUniqueSourceCodes) {
+      this.smallConceptMapIndexLru.set(cmKeyStr, flatIndex);
+      await this.primeExternalConceptMapCacheIfProvided(cmKey, cmKeyStr, flatIndex, true);
+      const { result, resolvedSourceSystem } = this.lookupInConceptMapIndexWithSourceSystem(flatIndex, code, system);
+      await this.syncExternalConceptMapCacheForLookup(cmKey, code, resolvedSourceSystem, result);
+      return result;
+    }
+
+    // Large: optionally prime external cache once per CM
+    await this.primeExternalConceptMapCacheIfProvided(cmKey, cmKeyStr, flatIndex, false);
+
+    const { result, resolvedSourceSystem } = this.lookupInConceptMapIndexWithSourceSystem(flatIndex, code, system);
+    this.conceptMapResultLru.set(lruKey, result);
+    await this.syncExternalConceptMapCacheForLookup(cmKey, code, resolvedSourceSystem, result);
+    return result;
+  }
+
+  private lookupInConceptMapIndexWithSourceSystem(
+    index: SmallConceptMapIndex,
+    code: string,
+    system?: string
+  ): { result: ConceptMapTranslation[]; resolvedSourceSystem?: string } {
+    const systemsMap = index.bySourceCode.get(code);
+    if (!systemsMap) return { result: [] };
+
+    if (system) {
+      return { result: systemsMap.get(system) || [], resolvedSourceSystem: system };
+    }
+
+    // code-only: ambiguous if multiple source systems exist for this code
+    if (systemsMap.size !== 1) {
+      return { result: [] };
+    }
+
+    const resolvedSourceSystem = systemsMap.keys().next().value as string | undefined;
+    const result = systemsMap.values().next().value || [];
+    return { result, resolvedSourceSystem };
+  }
+
+  private translationResultFromExternalEntry(entry: ConceptMapCacheEntry, system?: string): ConceptMapTranslation[] {
+    if (entry.status === 'no-translation') return [];
+    const map = entry.targetsBySourceSystem || {};
+    const sourceSystems = Object.keys(map);
+    if (system) return map[system] || [];
+    if (sourceSystems.length !== 1) return [];
+    return map[sourceSystems[0]] || [];
+  }
+
+  private async syncExternalConceptMapCacheForLookup(
+    cmKey: ConceptMapDeterministicKey,
+    code: string,
+    sourceSystem: string | undefined,
+    result: ConceptMapTranslation[]
+  ): Promise<void> {
+    const external = this.conceptMapCache;
+    if (!external) return;
+    try {
+      if (result.length === 0) {
+        await external.setCode(cmKey, code, { status: 'no-translation' });
+        return;
+      }
+
+      if (!sourceSystem) return;
+      const entry: ConceptMapCacheEntry = {
+        status: 'translated',
+        targetsBySourceSystem: {
+          [sourceSystem]: result
+        }
+      };
+      await external.setCode(cmKey, code, entry);
+    } catch {
+      /* c8 ignore next */
+    }
+  }
+
+  private async primeExternalConceptMapCacheIfProvided(
+    cmKey: ConceptMapDeterministicKey,
+    cmKeyStr: string,
+    index: SmallConceptMapIndex,
+    isSmall: boolean
+  ): Promise<void> {
+    const external = this.conceptMapCache;
+    if (!external) return;
+
+    const canUseSentinel = !index.bySourceCode.has(EXTERNAL_PRIMED_SENTINEL_CODE);
+
+    if (this.externallyPrimedConceptMaps.has(cmKeyStr)) return;
+
+    try {
+      if (canUseSentinel) {
+        const sentinel = await external.getCode(cmKey, EXTERNAL_PRIMED_SENTINEL_CODE);
+        if (sentinel) {
+          this.externallyPrimedConceptMaps.add(cmKeyStr);
+          return;
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    if (!isSmall) {
+      // Only prime large ConceptMaps on first use (best effort).
+    }
+
+    const entries: Array<[string, ConceptMapCacheEntry]> = [];
+    for (const [sourceCode, systemsMap] of index.bySourceCode.entries()) {
+      const targetsBySourceSystem: Record<string, ConceptMapTranslation[]> = {};
+      for (const [sourceSystem, targets] of systemsMap.entries()) {
+        targetsBySourceSystem[sourceSystem] = targets;
+      }
+      entries.push([sourceCode, { status: 'translated', targetsBySourceSystem }]);
+    }
+
+    try {
+      // Clear then repopulate is reserved for future server reload support.
+      // For package ConceptMaps we never need to clear.
+      if (external.bulkSetCodes) {
+        await external.bulkSetCodes(cmKey, entries);
+      } else {
+        for (const [code, entry] of entries) {
+          await external.setCode(cmKey, code, entry);
+        }
+      }
+      this.externallyPrimedConceptMaps.add(cmKeyStr);
+
+      if (canUseSentinel) {
+        await external.setCode(cmKey, EXTERNAL_PRIMED_SENTINEL_CODE, { status: 'no-translation' });
+      }
+    } catch {
+      /* c8 ignore next */
+    }
+  }
+  /* c8 ignore stop */
 };
 
 export type {
@@ -906,7 +1228,12 @@ export type {
   CodingLike,
   TerminologyMembershipCache,
   ValueSetDeterministicKey,
-  MembershipCacheEntry
+  MembershipCacheEntry,
+  TerminologyConceptMapCache,
+  ConceptMapDeterministicKey,
+  ConceptMapCacheEntry,
+  ConceptMapTranslation,
+  SupportedConceptMapEquivalence
 } from '../types';
 
 // Export implicit code systems for external usage
@@ -915,6 +1242,11 @@ export { ImplicitCodeSystemRegistry } from './utils';
 type SmallValueSetIndex = {
   byCode: Map<string, Map<string, ConceptProps>>;
   uniqueCodeCount: number;
+};
+
+type SmallConceptMapIndex = {
+  bySourceCode: Map<string, Map<string, ConceptMapTranslation[]>>;
+  uniqueSourceCodeCount: number;
 };
 
 class LruCache<K, V> {
@@ -983,3 +1315,58 @@ function buildIndexFromContains(flat: Array<{ system?: string; code?: string; di
   }
   return { byCode, uniqueCodeCount: byCode.size };
 }
+
+/* c8 ignore start */
+function buildIndexFromConceptMap(cm: any): SmallConceptMapIndex {
+  const bySourceCode = new Map<string, Map<string, ConceptMapTranslation[]>>();
+  const groups = Array.isArray(cm?.group) ? cm.group : [];
+  for (const group of groups) {
+    const groupSource = typeof group?.source === 'string' ? group.source : undefined;
+    const groupTarget = typeof group?.target === 'string' ? group.target : undefined;
+    const elements = Array.isArray(group?.element) ? group.element : [];
+    for (const el of elements) {
+      const sourceCode = typeof el?.code === 'string' ? el.code : undefined;
+      const sourceSystem = typeof el?.system === 'string' ? el.system : groupSource;
+      if (!sourceCode || !sourceSystem) continue;
+
+      const targets = Array.isArray(el?.target) ? el.target : [];
+      const outTargets: ConceptMapTranslation[] = [];
+      const seen = new Set<string>();
+      for (const t of targets) {
+        const targetCode = typeof t?.code === 'string' ? t.code : undefined;
+        const targetSystem = typeof t?.system === 'string' ? t.system : groupTarget;
+        if (!targetCode || !targetSystem) continue;
+
+        const eqRaw = (t as any)?.equivalence;
+        const equivalence: SupportedConceptMapEquivalence =
+          (typeof eqRaw === 'string' ? eqRaw : 'equivalent') as SupportedConceptMapEquivalence;
+        if (!SUPPORTED_CONCEPTMAP_EQUIVALENCE.has(equivalence)) continue;
+
+        const translation: ConceptMapTranslation = { system: targetSystem, code: targetCode, equivalence };
+        if (typeof t?.display === 'string') translation.display = t.display;
+        if (typeof t?.version === 'string') translation.version = t.version;
+
+        const key = `${equivalence}|${translation.system}|${translation.code}|${translation.version || ''}|${translation.display || ''}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        outTargets.push(translation);
+      }
+
+      if (outTargets.length === 0) continue;
+
+      let systemsMap = bySourceCode.get(sourceCode);
+      if (!systemsMap) {
+        systemsMap = new Map();
+        bySourceCode.set(sourceCode, systemsMap);
+      }
+      const existing = systemsMap.get(sourceSystem);
+      if (existing) {
+        systemsMap.set(sourceSystem, existing.concat(outTargets));
+      } else {
+        systemsMap.set(sourceSystem, outTargets);
+      }
+    }
+  }
+  return { bySourceCode, uniqueSourceCodeCount: bySourceCode.size };
+}
+/* c8 ignore stop */

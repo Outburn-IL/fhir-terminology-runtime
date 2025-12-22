@@ -51,6 +51,12 @@ export type TerminologyRuntimeConfig = {
    * Used by FhirTerminologyRuntime.inValueSet for high-performance lookups.
    */
   membershipCache?: TerminologyMembershipCache;
+
+  /**
+   * Optional external cache for ConceptMap translations.
+   * Used by FhirTerminologyRuntime.translateConceptMap for high-performance lookups.
+   */
+  conceptMapCache?: TerminologyConceptMapCache;
 };
 
 export type UnknownReason =
@@ -73,6 +79,26 @@ export type ConceptProps = {
   version?: string;
 };
 
+/**
+ * Supported ConceptMap.target.equivalence values for translation.
+ *
+ * - If missing (valid in FHIR R3), the default is treated as 'equivalent'.
+ * - Any other equivalence value is ignored by translateConceptMap.
+ */
+export type SupportedConceptMapEquivalence =
+  | 'equivalent'
+  | 'equal'
+  | 'wider'
+  | 'subsumes'
+  | 'relatedto';
+
+/**
+ * A translation target Coding plus metadata.
+ */
+export type ConceptMapTranslation = ConceptProps & {
+  equivalence: SupportedConceptMapEquivalence;
+};
+
 export type MembershipResult =
   | { status: 'member'; concept: ConceptProps }
   | { status: 'not-member' }
@@ -83,6 +109,43 @@ export type ValueSetDeterministicKey = {
   packageVersion: string;
   filename: string;
 };
+
+/**
+ * Deterministic key for a ConceptMap "namespace".
+ *
+ * - package: stable and immutable (packageId+version+filename)
+ * - server: reserved for future server-fetched ConceptMaps (keyed by server + canonical url)
+ */
+export type ConceptMapDeterministicKey =
+  | {
+      kind: 'package';
+      packageId: string;
+      packageVersion: string;
+      filename: string;
+    }
+  | {
+      kind: 'server';
+      serverBaseUrl: string;
+      url: string;
+    };
+
+export type ConceptMapCacheEntry =
+  | { status: 'translated'; targetsBySourceSystem: Record<string, ConceptMapTranslation[]> }
+  | { status: 'no-translation' };
+
+/**
+ * External (injectable) async cache for ConceptMap translations.
+ *
+ * - Stores/returns per-source-code entries (no full ConceptMap blobs).
+ * - Supports namespace eviction via clearNamespace (needed for future server reloading).
+ */
+export interface TerminologyConceptMapCache {
+  getCode(cm: ConceptMapDeterministicKey, code: string): Promise<ConceptMapCacheEntry | undefined>;
+  setCode(cm: ConceptMapDeterministicKey, code: string, entry: ConceptMapCacheEntry): Promise<void>;
+
+  bulkSetCodes?(cm: ConceptMapDeterministicKey, entries: Array<[string, ConceptMapCacheEntry]>): Promise<void>;
+  clearNamespace(cm: ConceptMapDeterministicKey): Promise<void>;
+}
 
 export type MembershipCacheEntry =
   | { status: 'member'; conceptsBySystem: Record<string, ConceptProps> }
