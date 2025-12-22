@@ -42,6 +42,7 @@ import type {
   ConceptMapDeterministicKey,
   ConceptMapCacheEntry,
   ConceptMapTranslation,
+  ConceptMapTranslationResult,
   SupportedConceptMapEquivalence
 } from '../types';
 
@@ -98,7 +99,7 @@ export class FhirTerminologyRuntime {
   // LRU: small ConceptMap indexes (<= 50 unique source codes)
   private smallConceptMapIndexLru = new LruCache<string, SmallConceptMapIndex>(FTR_DEFAULT_LIMITS.conceptMap.smallIndexLruSize);
   // LRU: per-code translation results for non-small ConceptMaps
-  private conceptMapResultLru = new LruCache<string, ConceptMapTranslation[]>(FTR_DEFAULT_LIMITS.conceptMap.hotCodeLruSize);
+  private conceptMapResultLru = new LruCache<string, ConceptMapTranslationResult>(FTR_DEFAULT_LIMITS.conceptMap.hotCodeLruSize);
 
   // In-memory guard for avoiding repeated external priming per VS key.
   private externallyPrimedValueSets: Set<string> = new Set();
@@ -1017,31 +1018,35 @@ export class FhirTerminologyRuntime {
     codeOrCoding: string | CodingLike,
     conceptMap: string | FileIndexEntryWithPkg,
     packageFilter?: FhirPackageIdentifier
-  ): Promise<ConceptMapTranslation[]> {
+  ): Promise<ConceptMapTranslationResult> {
     const { code, system } = this.normalizeCodeOrCoding(codeOrCoding);
-    if (!code) return [];
+    if (!code) return { status: 'unmapped', reason: 'invalid-code' };
 
     let meta: FileIndexEntryWithPkg;
     try {
       meta = typeof conceptMap === 'string' ? await this.getConceptMapMetadata(conceptMap, packageFilter) : conceptMap;
-      if (!meta) return [];
+      if (!meta) return { status: 'unmapped', reason: 'unknown-conceptmap' };
     } catch {
-      return [];
+      return { status: 'unmapped', reason: 'unknown-conceptmap' };
     }
 
     let cmKey: ConceptMapDeterministicKey;
     try {
       cmKey = this.toConceptMapDeterministicKey(meta);
     } catch {
-      return [];
+      return { status: 'unmapped', reason: 'unknown-conceptmap' };
     }
     const cmKeyStr = this.toConceptMapKeyString(cmKey);
 
     // Layer 1: small ConceptMap index LRU
     const smallIndex = this.smallConceptMapIndexLru.get(cmKeyStr);
     if (smallIndex) {
-      const { result, resolvedSourceSystem } = this.lookupInConceptMapIndexWithSourceSystem(smallIndex, code, system);
-      await this.syncExternalConceptMapCacheForLookup(cmKey, code, resolvedSourceSystem, result);
+      const { result, resolvedSourceSystem, targetsBySourceSystem } = this.lookupInConceptMapIndexWithSourceSystem(
+        smallIndex,
+        code,
+        system
+      );
+      await this.syncExternalConceptMapCacheForLookup(cmKey, code, resolvedSourceSystem, result, targetsBySourceSystem);
       return result;
     }
 
@@ -1071,12 +1076,12 @@ export class FhirTerminologyRuntime {
     let cm: any;
     try {
       /* c8 ignore next */
-      if (cmKey.kind !== 'package') return [];
+      if (cmKey.kind !== 'package') return { status: 'unmapped', reason: 'unknown-conceptmap' };
       cm = await this.getConceptMapByFileName(cmKey.filename, cmKey.packageId, cmKey.packageVersion);
     } catch {
-      return [];
+      return { status: 'unmapped', reason: 'unknown-conceptmap' };
     }
-    if (!cm || cm.resourceType !== 'ConceptMap') return [];
+    if (!cm || cm.resourceType !== 'ConceptMap') return { status: 'unmapped', reason: 'unknown-conceptmap' };
 
     const flatIndex = buildIndexFromConceptMap(cm);
 
@@ -1084,17 +1089,25 @@ export class FhirTerminologyRuntime {
     if (flatIndex.uniqueSourceCodeCount <= FTR_DEFAULT_LIMITS.conceptMap.smallThresholdUniqueSourceCodes) {
       this.smallConceptMapIndexLru.set(cmKeyStr, flatIndex);
       await this.primeExternalConceptMapCacheIfProvided(cmKey, cmKeyStr, flatIndex, true);
-      const { result, resolvedSourceSystem } = this.lookupInConceptMapIndexWithSourceSystem(flatIndex, code, system);
-      await this.syncExternalConceptMapCacheForLookup(cmKey, code, resolvedSourceSystem, result);
+      const { result, resolvedSourceSystem, targetsBySourceSystem } = this.lookupInConceptMapIndexWithSourceSystem(
+        flatIndex,
+        code,
+        system
+      );
+      await this.syncExternalConceptMapCacheForLookup(cmKey, code, resolvedSourceSystem, result, targetsBySourceSystem);
       return result;
     }
 
     // Large: optionally prime external cache once per CM
     await this.primeExternalConceptMapCacheIfProvided(cmKey, cmKeyStr, flatIndex, false);
 
-    const { result, resolvedSourceSystem } = this.lookupInConceptMapIndexWithSourceSystem(flatIndex, code, system);
+    const { result, resolvedSourceSystem, targetsBySourceSystem } = this.lookupInConceptMapIndexWithSourceSystem(
+      flatIndex,
+      code,
+      system
+    );
     this.conceptMapResultLru.set(lruKey, result);
-    await this.syncExternalConceptMapCacheForLookup(cmKey, code, resolvedSourceSystem, result);
+    await this.syncExternalConceptMapCacheForLookup(cmKey, code, resolvedSourceSystem, result, targetsBySourceSystem);
     return result;
   }
 
@@ -1102,52 +1115,117 @@ export class FhirTerminologyRuntime {
     index: SmallConceptMapIndex,
     code: string,
     system?: string
-  ): { result: ConceptMapTranslation[]; resolvedSourceSystem?: string } {
+  ): {
+    result: ConceptMapTranslationResult;
+    resolvedSourceSystem?: string;
+    targetsBySourceSystem?: Record<string, { targets: ConceptMapTranslation[]; ignoredEquivalences?: string[] }>;
+  } {
     const systemsMap = index.bySourceCode.get(code);
-    if (!systemsMap) return { result: [] };
+    if (!systemsMap) return { result: { status: 'unmapped', reason: 'no-source-code' } };
+
+    const targetsBySourceSystem: Record<string, { targets: ConceptMapTranslation[]; ignoredEquivalences?: string[] }> = {};
+    for (const [sourceSystem, facts] of systemsMap.entries()) {
+      targetsBySourceSystem[sourceSystem] = {
+        targets: facts.targets,
+        ...(facts.ignoredEquivalences && facts.ignoredEquivalences.length ? { ignoredEquivalences: facts.ignoredEquivalences } : {})
+      };
+    }
 
     if (system) {
-      return { result: systemsMap.get(system) || [], resolvedSourceSystem: system };
+      const facts = systemsMap.get(system);
+      if (!facts) {
+        return { result: { status: 'unmapped', reason: 'no-translation' }, resolvedSourceSystem: system, targetsBySourceSystem };
+      }
+
+      if (facts.targets.length === 0) {
+        if (facts.ignoredEquivalences && facts.ignoredEquivalences.length) {
+          return {
+            result: { status: 'unmapped', reason: 'unsupported-equivalence', ignoredEquivalences: facts.ignoredEquivalences },
+            resolvedSourceSystem: system,
+            targetsBySourceSystem
+          };
+        }
+        return { result: { status: 'unmapped', reason: 'no-translation' }, resolvedSourceSystem: system, targetsBySourceSystem };
+      }
+
+      return { result: { status: 'mapped', targets: facts.targets }, resolvedSourceSystem: system, targetsBySourceSystem };
     }
 
     // code-only: ambiguous if multiple source systems exist for this code
     if (systemsMap.size !== 1) {
-      return { result: [] };
+      return { result: { status: 'unmapped', reason: 'duplicate-code' }, targetsBySourceSystem };
     }
 
     const resolvedSourceSystem = systemsMap.keys().next().value as string | undefined;
-    const result = systemsMap.values().next().value || [];
-    return { result, resolvedSourceSystem };
+    const facts = systemsMap.values().next().value;
+    const targets = facts?.targets || [];
+    if (targets.length === 0) {
+      if (facts?.ignoredEquivalences && facts.ignoredEquivalences.length) {
+        return {
+          result: { status: 'unmapped', reason: 'unsupported-equivalence', ignoredEquivalences: facts.ignoredEquivalences },
+          resolvedSourceSystem,
+          targetsBySourceSystem
+        };
+      }
+      return { result: { status: 'unmapped', reason: 'no-translation' }, resolvedSourceSystem, targetsBySourceSystem };
+    }
+    return { result: { status: 'mapped', targets }, resolvedSourceSystem, targetsBySourceSystem };
   }
 
-  private translationResultFromExternalEntry(entry: ConceptMapCacheEntry, system?: string): ConceptMapTranslation[] {
-    if (entry.status === 'no-translation') return [];
-    const map = entry.targetsBySourceSystem || {};
+  private translationResultFromExternalEntry(entry: ConceptMapCacheEntry, system?: string): ConceptMapTranslationResult {
+    if (entry.status === 'not-found') return { status: 'unmapped', reason: 'no-source-code' };
+    const map = entry.bySourceSystem || {};
     const sourceSystems = Object.keys(map);
-    if (system) return map[system] || [];
-    if (sourceSystems.length !== 1) return [];
-    return map[sourceSystems[0]] || [];
+    if (system) {
+      const facts = map[system];
+      if (!facts) return { status: 'unmapped', reason: 'no-translation' };
+      if (!facts.targets?.length) {
+        if (facts.ignoredEquivalences?.length) {
+          return { status: 'unmapped', reason: 'unsupported-equivalence', ignoredEquivalences: facts.ignoredEquivalences };
+        }
+        return { status: 'unmapped', reason: 'no-translation' };
+      }
+      return { status: 'mapped', targets: facts.targets };
+    }
+    if (sourceSystems.length !== 1) return { status: 'unmapped', reason: 'duplicate-code' };
+    const facts = map[sourceSystems[0]];
+    if (!facts?.targets?.length) {
+      if (facts?.ignoredEquivalences?.length) {
+        return { status: 'unmapped', reason: 'unsupported-equivalence', ignoredEquivalences: facts.ignoredEquivalences };
+      }
+      return { status: 'unmapped', reason: 'no-translation' };
+    }
+    return { status: 'mapped', targets: facts.targets };
   }
 
   private async syncExternalConceptMapCacheForLookup(
     cmKey: ConceptMapDeterministicKey,
     code: string,
     sourceSystem: string | undefined,
-    result: ConceptMapTranslation[]
+    result: ConceptMapTranslationResult,
+    targetsBySourceSystem?: Record<string, { targets: ConceptMapTranslation[]; ignoredEquivalences?: string[] }>
   ): Promise<void> {
     const external = this.conceptMapCache;
     if (!external) return;
     try {
-      if (result.length === 0) {
-        await external.setCode(cmKey, code, { status: 'no-translation' });
+      if (result.status === 'unmapped') {
+        if (result.reason === 'no-source-code') {
+          await external.setCode(cmKey, code, { status: 'not-found' });
+          return;
+        }
+
+        if (targetsBySourceSystem) {
+          await external.setCode(cmKey, code, { status: 'found', bySourceSystem: targetsBySourceSystem });
+          return;
+        }
         return;
       }
 
       if (!sourceSystem) return;
       const entry: ConceptMapCacheEntry = {
-        status: 'translated',
-        targetsBySourceSystem: {
-          [sourceSystem]: result
+        status: 'found',
+        bySourceSystem: {
+          [sourceSystem]: { targets: result.targets }
         }
       };
       await external.setCode(cmKey, code, entry);
@@ -1187,11 +1265,14 @@ export class FhirTerminologyRuntime {
 
     const entries: Array<[string, ConceptMapCacheEntry]> = [];
     for (const [sourceCode, systemsMap] of index.bySourceCode.entries()) {
-      const targetsBySourceSystem: Record<string, ConceptMapTranslation[]> = {};
-      for (const [sourceSystem, targets] of systemsMap.entries()) {
-        targetsBySourceSystem[sourceSystem] = targets;
+      const bySourceSystem: Record<string, { targets: ConceptMapTranslation[]; ignoredEquivalences?: string[] }> = {};
+      for (const [sourceSystem, facts] of systemsMap.entries()) {
+        bySourceSystem[sourceSystem] = {
+          targets: facts.targets,
+          ...(facts.ignoredEquivalences && facts.ignoredEquivalences.length ? { ignoredEquivalences: facts.ignoredEquivalences } : {})
+        };
       }
-      entries.push([sourceCode, { status: 'translated', targetsBySourceSystem }]);
+      entries.push([sourceCode, { status: 'found', bySourceSystem }]);
     }
 
     try {
@@ -1207,7 +1288,7 @@ export class FhirTerminologyRuntime {
       this.externallyPrimedConceptMaps.add(cmKeyStr);
 
       if (canUseSentinel) {
-        await external.setCode(cmKey, EXTERNAL_PRIMED_SENTINEL_CODE, { status: 'no-translation' });
+        await external.setCode(cmKey, EXTERNAL_PRIMED_SENTINEL_CODE, { status: 'not-found' });
       }
     } catch {
       /* c8 ignore next */
@@ -1232,6 +1313,8 @@ export type {
   ConceptMapDeterministicKey,
   ConceptMapCacheEntry,
   ConceptMapTranslation,
+  ConceptMapTranslationResult,
+  ConceptMapUnmappedReason,
   SupportedConceptMapEquivalence
 } from '../types';
 
@@ -1244,7 +1327,7 @@ type SmallValueSetIndex = {
 };
 
 type SmallConceptMapIndex = {
-  bySourceCode: Map<string, Map<string, ConceptMapTranslation[]>>;
+  bySourceCode: Map<string, Map<string, { targets: ConceptMapTranslation[]; ignoredEquivalences?: string[] }>>;
   uniqueSourceCodeCount: number;
 };
 
@@ -1317,7 +1400,7 @@ function buildIndexFromContains(flat: Array<{ system?: string; code?: string; di
 
 /* c8 ignore start */
 function buildIndexFromConceptMap(cm: any): SmallConceptMapIndex {
-  const bySourceCode = new Map<string, Map<string, ConceptMapTranslation[]>>();
+  const bySourceCode = new Map<string, Map<string, { targets: ConceptMapTranslation[]; ignoredEquivalences?: string[] }>>();
   const groups = Array.isArray(cm?.group) ? cm.group : [];
   for (const group of groups) {
     const groupSource = typeof group?.source === 'string' ? group.source : undefined;
@@ -1331,6 +1414,7 @@ function buildIndexFromConceptMap(cm: any): SmallConceptMapIndex {
       const targets = Array.isArray(el?.target) ? el.target : [];
       const outTargets: ConceptMapTranslation[] = [];
       const seen = new Set<string>();
+      const ignoredEquivalences = new Set<string>();
       for (const t of targets) {
         const targetCode = typeof t?.code === 'string' ? t.code : undefined;
         const targetSystem = typeof t?.system === 'string' ? t.system : groupTarget;
@@ -1339,7 +1423,10 @@ function buildIndexFromConceptMap(cm: any): SmallConceptMapIndex {
         const eqRaw = (t as any)?.equivalence;
         const equivalence: SupportedConceptMapEquivalence =
           (typeof eqRaw === 'string' ? eqRaw : 'equivalent') as SupportedConceptMapEquivalence;
-        if (!SUPPORTED_CONCEPTMAP_EQUIVALENCE.has(equivalence)) continue;
+        if (!SUPPORTED_CONCEPTMAP_EQUIVALENCE.has(equivalence)) {
+          if (typeof eqRaw === 'string') ignoredEquivalences.add(eqRaw);
+          continue;
+        }
 
         const translation: ConceptMapTranslation = { system: targetSystem, code: targetCode, equivalence };
         if (typeof t?.display === 'string') translation.display = t.display;
@@ -1351,19 +1438,31 @@ function buildIndexFromConceptMap(cm: any): SmallConceptMapIndex {
         outTargets.push(translation);
       }
 
-      if (outTargets.length === 0) continue;
-
       let systemsMap = bySourceCode.get(sourceCode);
       if (!systemsMap) {
         systemsMap = new Map();
         bySourceCode.set(sourceCode, systemsMap);
       }
-      const existing = systemsMap.get(sourceSystem);
-      if (existing) {
-        systemsMap.set(sourceSystem, existing.concat(outTargets));
-      } else {
-        systemsMap.set(sourceSystem, outTargets);
+
+      const existingFacts = systemsMap.get(sourceSystem);
+      const mergedTargets = (existingFacts?.targets || []).concat(outTargets);
+
+      const dedupedTargets: ConceptMapTranslation[] = [];
+      const mergedSeen = new Set<string>();
+      for (const tr of mergedTargets) {
+        const key = `${tr.equivalence}|${tr.system}|${tr.code}|${tr.version || ''}|${tr.display || ''}`;
+        if (mergedSeen.has(key)) continue;
+        mergedSeen.add(key);
+        dedupedTargets.push(tr);
       }
+
+      const mergedIgnored = new Set<string>(existingFacts?.ignoredEquivalences || []);
+      for (const v of ignoredEquivalences) mergedIgnored.add(v);
+
+      const facts: { targets: ConceptMapTranslation[]; ignoredEquivalences?: string[] } = { targets: dedupedTargets };
+      if (mergedIgnored.size) facts.ignoredEquivalences = Array.from(mergedIgnored);
+
+      systemsMap.set(sourceSystem, facts);
     }
   }
   return { bySourceCode, uniqueSourceCodeCount: bySourceCode.size };

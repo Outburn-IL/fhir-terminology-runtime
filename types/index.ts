@@ -98,6 +98,19 @@ export type ConceptMapTranslation = ConceptProps & {
   equivalence: SupportedConceptMapEquivalence;
 };
 
+export type ConceptMapUnmappedReason =
+  | 'unknown-conceptmap'
+  | 'duplicate-code'
+  | 'no-source-code'
+  | 'no-translation'
+  | 'unsupported-equivalence'
+  | 'invalid-code';
+
+export type ConceptMapTranslationResult =
+  | { status: 'mapped'; targets: ConceptMapTranslation[] }
+  | { status: 'unmapped'; reason: Exclude<ConceptMapUnmappedReason, 'unsupported-equivalence'> }
+  | { status: 'unmapped'; reason: 'unsupported-equivalence'; ignoredEquivalences: string[] };
+
 export type MembershipResult =
   | { status: 'member'; concept: ConceptProps }
   | { status: 'not-member' }
@@ -129,8 +142,11 @@ export type ConceptMapDeterministicKey =
     };
 
 export type ConceptMapCacheEntry =
-  | { status: 'translated'; targetsBySourceSystem: Record<string, ConceptMapTranslation[]> }
-  | { status: 'no-translation' };
+  | {
+      status: 'found';
+      bySourceSystem: Record<string, { targets: ConceptMapTranslation[]; ignoredEquivalences?: string[] }>;
+    }
+  | { status: 'not-found' };
 
 /**
  * External (injectable) async cache for ConceptMap translations.
