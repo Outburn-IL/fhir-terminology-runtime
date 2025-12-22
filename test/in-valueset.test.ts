@@ -401,7 +401,7 @@ describe('inValueSet (unit) - cache and priming branches', () => {
 
     const first = await ftr.inValueSet('C10', 'vs-large');
     expect(first.status).toBe('member');
-    // 60 codes primed + 1 sentinel primed marker + 1 syncExternalCacheForLookup call
+    // 60 codes primed + 1 sentinel primed marker + 1 syncExternalMembershipCacheForLookup call
     expect(setCodeCalls).toBe(62);
 
     const secondDifferentCode = await ftr.inValueSet('C11', 'vs-large');

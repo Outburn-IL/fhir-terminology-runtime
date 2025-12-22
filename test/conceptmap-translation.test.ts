@@ -29,6 +29,12 @@ describe('translateConceptMap (unit)', () => {
                 { code: 'NOPE', equivalence: 'disjoint' }, // ignored
                 { code: '3' } // equivalence missing (R3) => treated as 'equivalent'
               ]
+            },
+            {
+              code: 'UNSUP',
+              target: [
+                { code: 'X', equivalence: 'disjoint' }
+              ]
             }
           ]
         },
@@ -39,7 +45,7 @@ describe('translateConceptMap (unit)', () => {
             {
               code: 'A',
               target: [
-                { system: 'http://example.org/system/alt-target', code: 'ALT', equivalence: 'relatedto' }
+                { system: 'http://example.org/system/alt-target', code: 'ALT', equivalence: 'wider' }
               ]
             }
           ]
@@ -146,23 +152,38 @@ describe('translateConceptMap (unit)', () => {
 
   it('translates by code-only when unambiguous and filters equivalence', async () => {
     const r1 = await ftr.translateConceptMap('A', 'cm-small');
-    expect(r1.length).toBe(2);
-    expect(r1.find(t => t.code === '1')?.system).toBe('http://example.org/system/target');
-    expect(r1.find(t => t.code === 'ALT')?.system).toBe('http://example.org/system/alt-target');
+    expect(r1.status).toBe('mapped');
+    if (r1.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r1.targets.length).toBe(2);
+    expect(r1.targets.find(t => t.code === '1')?.system).toBe('http://example.org/system/target');
+    expect(r1.targets.find(t => t.code === 'ALT')?.system).toBe('http://example.org/system/alt-target');
 
     const r2 = await ftr.translateConceptMap('B', 'cm-small');
-    expect(r2.map(t => t.code)).toEqual(['3']);
-    expect(r2[0].equivalence).toBe('equivalent');
+    expect(r2.status).toBe('mapped');
+    if (r2.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r2.targets.map(t => t.code)).toEqual(['3']);
+    expect(r2.targets[0].equivalence).toBe('equivalent');
   });
 
-  it('returns [] for code-only when duplicated across source systems', async () => {
+  it('returns duplicate-code for code-only when duplicated across source systems', async () => {
     const r = await ftr.translateConceptMap('DUP', 'cm-dup');
-    expect(r).toEqual([]);
+    expect(r).toEqual({ status: 'unmapped', reason: 'duplicate-code' });
+  });
+
+  it('returns unsupported-equivalence when source exists but only unsupported target equivalence values are present', async () => {
+    const r = await ftr.translateConceptMap('UNSUP', 'cm-small');
+    expect(r.status).toBe('unmapped');
+    if (r.status !== 'unmapped') throw new Error('Expected unmapped');
+    expect(r.reason).toBe('unsupported-equivalence');
+    if (r.reason !== 'unsupported-equivalence') throw new Error('Expected unsupported-equivalence');
+    expect(r.ignoredEquivalences).toContain('disjoint');
   });
 
   it('supports system-specific disambiguation', async () => {
     const r = await ftr.translateConceptMap({ system: 'http://example.org/system/source2', code: 'DUP' }, 'cm-dup');
-    expect(r.map(t => t.code)).toEqual(['Y']);
+    expect(r.status).toBe('mapped');
+    if (r.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r.targets.map(t => t.code)).toEqual(['Y']);
   });
 
   it('primes external cache for large maps and allows cold-start external hits', async () => {
@@ -221,7 +242,9 @@ describe('translateConceptMap (unit)', () => {
     });
 
     const r1 = await ftr1.translateConceptMap('C5', 'cm-large');
-    expect(r1.map(t => t.code)).toEqual(['T5']);
+    expect(r1.status).toBe('mapped');
+    if (r1.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r1.targets.map(t => t.code)).toEqual(['T5']);
     expect(bulkSetCount).toBe(1);
     expect(resolveCount).toBe(1);
 
@@ -231,8 +254,8 @@ describe('translateConceptMap (unit)', () => {
     // Ensure per-lookup sync stored a translated entry too
     const ns = `package:${pkg.id}#${pkg.version}::cm-large.json`;
     const entry = externalStore.get(`${ns}|C5`);
-    expect(entry?.status).toBe('translated');
-    expect(entry?.targetsBySourceSystem?.['http://example.org/system/source']?.[0]?.code).toBe('T5');
+    expect(entry?.status).toBe('found');
+    expect(entry?.bySourceSystem?.['http://example.org/system/source']?.targets?.[0]?.code).toBe('T5');
 
     // cold-start: new runtime instance should avoid resolving ConceptMap by using external cache
     resolveCount = 0;
@@ -244,7 +267,9 @@ describe('translateConceptMap (unit)', () => {
     });
 
     const r2 = await ftr2.translateConceptMap('C9', 'cm-large');
-    expect(r2.map(t => t.code)).toEqual(['T9']);
+    expect(r2.status).toBe('mapped');
+    if (r2.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r2.targets.map(t => t.code)).toEqual(['T9']);
     expect(resolveCount).toBe(0);
   });
 
@@ -287,7 +312,9 @@ describe('translateConceptMap (unit)', () => {
     });
 
     const r = await ftrLocal.translateConceptMap('C1', 'cm-large');
-    expect(r.map(t => t.code)).toEqual(['T1']);
+    expect(r.status).toBe('mapped');
+    if (r.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r.targets.map(t => t.code)).toEqual(['T1']);
     // priming writes a lot, but we just assert it used setCode at least once
     expect(setCount).toBeGreaterThan(1);
   });
@@ -336,7 +363,9 @@ describe('translateConceptMap (unit)', () => {
     });
 
     const r = await ftrLocal.translateConceptMap('A', 'cm-small');
-    expect(r.length).toBe(2);
+    expect(r.status).toBe('mapped');
+    if (r.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r.targets.length).toBe(2);
     expect(bulkSetCount).toBe(1);
   });
 
@@ -365,7 +394,7 @@ describe('translateConceptMap (unit)', () => {
 
     // Pre-seed sentinel so priming short-circuits
     const sentinelNs = `package:${pkg.id}#${pkg.version}::cm-large.json`;
-    externalStore.set(`${sentinelNs}|__ftr__primed__`, { status: 'no-translation' });
+    externalStore.set(`${sentinelNs}|__ftr__primed__`, { status: 'not-found' });
 
     const fpeStub: any = {
       getCachePath: () => 'C:/tmp/fhir-cache',
@@ -387,13 +416,15 @@ describe('translateConceptMap (unit)', () => {
     });
 
     const r = await ftrLocal.translateConceptMap('C2', 'cm-large');
-    expect(r.map(t => t.code)).toEqual(['T2']);
+    expect(r.status).toBe('mapped');
+    if (r.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r.targets.map(t => t.code)).toEqual(['T2']);
     expect(bulkSetCount).toBe(0);
 
     // With priming skipped, we still expect a translated per-lookup write.
     const entry = externalStore.get(`${sentinelNs}|C2`);
-    expect(entry?.status).toBe('translated');
-    expect(entry?.targetsBySourceSystem?.['http://example.org/system/source']?.[0]?.code).toBe('T2');
+    expect(entry?.status).toBe('found');
+    expect(entry?.bySourceSystem?.['http://example.org/system/source']?.targets?.[0]?.code).toBe('T2');
     expect(setCount).toBeGreaterThan(0);
   });
 
@@ -436,7 +467,9 @@ describe('translateConceptMap (unit)', () => {
     });
 
     const r = await ftrLocal.translateConceptMap('__ftr__primed__', 'cm-has-sentinel');
-    expect(r.map(t => `${t.system}|${t.code}|${t.version}|${t.display}`)).toEqual([
+    expect(r.status).toBe('mapped');
+    if (r.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r.targets.map(t => `${t.system}|${t.code}|${t.version}|${t.display}`)).toEqual([
       'http://example.org/system/target|REAL|1|Real'
     ]);
 
@@ -474,11 +507,15 @@ describe('translateConceptMap (unit)', () => {
 
     // identifier contains ':' => tries url branch first, then id
     const byUrlThenId = await ftrLocal.translateConceptMap('A', 'http://example.org/ConceptMap/cm-small');
-    expect(byUrlThenId.length).toBe(2);
+    expect(byUrlThenId.status).toBe('mapped');
+    if (byUrlThenId.status !== 'mapped') throw new Error('Expected mapped');
+    expect(byUrlThenId.targets.length).toBe(2);
     expect(urlAttempts).toBeGreaterThan(0);
 
     const byName = await ftrLocal.translateConceptMap('A', 'cm-small-name');
-    expect(byName.length).toBe(2);
+    expect(byName.status).toBe('mapped');
+    if (byName.status !== 'mapped') throw new Error('Expected mapped');
+    expect(byName.targets.length).toBe(2);
   });
 
   it('falls back to local evaluation when external cache getCode throws', async () => {
@@ -521,7 +558,9 @@ describe('translateConceptMap (unit)', () => {
     });
 
     const r = await ftrLocal.translateConceptMap('A', 'cm-small');
-    expect(r.length).toBe(2);
+    expect(r.status).toBe('mapped');
+    if (r.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r.targets.length).toBe(2);
     expect(throws).toBeGreaterThan(0);
     expect(resolveCalls).toBe(1);
   });
@@ -545,10 +584,10 @@ describe('translateConceptMap (unit)', () => {
     const ns = `package:${pkg.id}#${pkg.version}::cm-dup.json`;
     // External entry with two source systems => ambiguous for code-only
     externalStore.set(`${ns}|DUP`, {
-      status: 'translated',
-      targetsBySourceSystem: {
-        'http://example.org/system/source1': [{ system: 'http://example.org/system/target', code: 'X', equivalence: 'equivalent' }],
-        'http://example.org/system/source2': [{ system: 'http://example.org/system/target', code: 'Y', equivalence: 'equivalent' }]
+      status: 'found',
+      bySourceSystem: {
+        'http://example.org/system/source1': { targets: [{ system: 'http://example.org/system/target', code: 'X', equivalence: 'equivalent' }] },
+        'http://example.org/system/source2': { targets: [{ system: 'http://example.org/system/target', code: 'Y', equivalence: 'equivalent' }] }
       }
     });
 
@@ -576,15 +615,17 @@ describe('translateConceptMap (unit)', () => {
     });
 
     const r1 = await ftrExternalOnly.translateConceptMap('DUP', 'cm-dup');
-    expect(r1).toEqual([]);
+    expect(r1).toEqual({ status: 'unmapped', reason: 'duplicate-code' });
 
     const r2 = await ftrExternalOnly.translateConceptMap({ system: 'http://example.org/system/source1', code: 'DUP' }, 'cm-dup');
-    expect(r2.map(t => t.code)).toEqual(['X']);
+    expect(r2.status).toBe('mapped');
+    if (r2.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r2.targets.map(t => t.code)).toEqual(['X']);
 
     expect(resolveCalls).toBe(0);
   });
 
-  it('returns [] when resolved resource is not a ConceptMap', async () => {
+  it('returns unknown-conceptmap when resolved resource is not a ConceptMap', async () => {
     const fpeStub: any = {
       getCachePath: () => 'C:/tmp/fhir-cache',
       getContextPackages: () => [],
@@ -604,10 +645,10 @@ describe('translateConceptMap (unit)', () => {
     });
 
     const r = await ftrLocal.translateConceptMap('A', 'cm-small');
-    expect(r).toEqual([]);
+    expect(r).toEqual({ status: 'unmapped', reason: 'unknown-conceptmap' });
   });
 
-  it('returns [] when ConceptMap resolve returns undefined', async () => {
+  it('returns unknown-conceptmap when ConceptMap resolve returns undefined', async () => {
     const fpeStub: any = {
       getCachePath: () => 'C:/tmp/fhir-cache',
       getContextPackages: () => [],
@@ -627,10 +668,10 @@ describe('translateConceptMap (unit)', () => {
     });
 
     const r = await ftrLocal.translateConceptMap('A', 'cm-small');
-    expect(r).toEqual([]);
+    expect(r).toEqual({ status: 'unmapped', reason: 'unknown-conceptmap' });
   });
 
-  it('returns [] for unknown ConceptMap identifiers', async () => {
+  it('returns unknown-conceptmap for unknown ConceptMap identifiers', async () => {
     const fpeStub: any = {
       getCachePath: () => 'C:/tmp/fhir-cache',
       getContextPackages: () => [],
@@ -650,7 +691,7 @@ describe('translateConceptMap (unit)', () => {
     });
 
     const r = await ftrLocal.translateConceptMap('A', 'does-not-exist');
-    expect(r).toEqual([]);
+    expect(r).toEqual({ status: 'unmapped', reason: 'unknown-conceptmap' });
   });
 
   it('uses hot per-code LRU for large ConceptMaps', async () => {
@@ -694,15 +735,19 @@ describe('translateConceptMap (unit)', () => {
 
     const r1 = await ftrLocal.translateConceptMap('C10', 'cm-large');
     const r2 = await ftrLocal.translateConceptMap('C10', 'cm-large');
-    expect(r1.map(t => t.code)).toEqual(['T10']);
-    expect(r2.map(t => t.code)).toEqual(['T10']);
+    expect(r1.status).toBe('mapped');
+    if (r1.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r1.targets.map(t => t.code)).toEqual(['T10']);
+    expect(r2.status).toBe('mapped');
+    if (r2.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r2.targets.map(t => t.code)).toEqual(['T10']);
 
     // second call should be served from in-memory hot LRU (no extra resolve)
     expect(resolveCalls).toBe(1);
     expect(getCount).toBeGreaterThan(0);
   });
 
-  it('returns [] from external cache when entry is no-translation', async () => {
+  it('returns no-source-code from external cache when entry is not-found', async () => {
     const externalStore = new Map<string, any>();
 
     const conceptMapCache: any = {
@@ -719,7 +764,7 @@ describe('translateConceptMap (unit)', () => {
     };
 
     const ns = `package:${pkg.id}#${pkg.version}::cm-small.json`;
-    externalStore.set(`${ns}|Z`, { status: 'no-translation' });
+    externalStore.set(`${ns}|Z`, { status: 'not-found' });
 
     const fpeStub: any = {
       getCachePath: () => 'C:/tmp/fhir-cache',
@@ -743,6 +788,6 @@ describe('translateConceptMap (unit)', () => {
     });
 
     const r = await ftrExternalOnly.translateConceptMap('Z', 'cm-small');
-    expect(r).toEqual([]);
+    expect(r).toEqual({ status: 'unmapped', reason: 'no-source-code' });
   });
 });
