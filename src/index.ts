@@ -1010,7 +1010,8 @@ export class FhirTerminologyRuntime {
   /**
    * Translate a source code (string) or Coding-like input using a ConceptMap.
    *
-   * - Returns 0..N target Codings.
+    * - Returns a result object (`mapped` / `unmapped`).
+    * - When `mapped`, the result includes 1..N target Codings in `targets`.
    * - Code-only lookups are supported when the source code is not duplicated across multiple source systems.
    * - Only ConceptMap.target entries with supported equivalence are used.
    */
