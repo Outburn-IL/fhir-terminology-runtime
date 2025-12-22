@@ -453,6 +453,7 @@ export class FhirTerminologyRuntime {
       } else {
         metadata = identifier;
       }
+    // eslint-disable-next-line no-unused-vars
     } catch (e) {
       // Resolution failed
       const result: CountResult = { status: 'unknown', reason: 'unknown-valueset' };
@@ -487,6 +488,7 @@ export class FhirTerminologyRuntime {
       this.expansionCountCache.set(cacheKey, result);
       return result;
 
+    // eslint-disable-next-line no-unused-vars
     } catch (e) {
       // Expansion failed
       const result: CountResult = { status: 'unknown', reason: 'unexpandable-valueset' };
