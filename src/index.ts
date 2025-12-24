@@ -356,9 +356,9 @@ export class FhirTerminologyRuntime {
     const promise = (async () => {
       // Order: url, id, name
       const attempts: Array<() => Promise<any>> = [
-        () => client.resolve('ConceptMap', { url: identifier }),
-        () => client.resolve(`ConceptMap/${identifier}`),
-        () => client.resolve('ConceptMap', { name: identifier })
+        () => client.resolve('ConceptMap', { url: identifier }, { noCache: true }),
+        () => client.resolve(`ConceptMap/${identifier}`, undefined, { noCache: true }),
+        () => client.resolve('ConceptMap', { name: identifier }, { noCache: true })
       ];
 
       const localErrors: unknown[] = [];
@@ -399,7 +399,7 @@ export class FhirTerminologyRuntime {
     if (!client) throw new Error('FHIR client not configured for server ConceptMap resolution.');
     const id = this.getConceptMapIdFromServerKey(cmKey);
     if (!id) throw new Error(`Invalid server ConceptMap key url '${cmKey.url}' (cannot extract id).`);
-    return await client.resolve(`ConceptMap/${id}`);
+    return await client.resolve(`ConceptMap/${id}`, undefined, { noCache: true });
   }
 
   public async clearServerConceptMapsFromCache(serverBaseUrl?: string): Promise<void> {
