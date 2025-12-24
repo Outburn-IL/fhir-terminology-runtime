@@ -1289,7 +1289,7 @@ export class FhirTerminologyRuntime {
     targetsBySourceSystem?: Record<string, { targets: ConceptMapTranslation[]; ignoredEquivalences?: string[] }>;
   } {
     const systemsMap = index.bySourceCode.get(code);
-    if (!systemsMap) return { result: { status: 'unmapped', reason: 'no-source-code' } };
+    if (!systemsMap) return { result: { status: 'unmapped', reason: 'code-not-in-conceptmap' } };
 
     const targetsBySourceSystem: Record<string, { targets: ConceptMapTranslation[]; ignoredEquivalences?: string[] }> = {};
     for (const [sourceSystem, facts] of systemsMap.entries()) {
@@ -1341,7 +1341,7 @@ export class FhirTerminologyRuntime {
   }
 
   private translationResultFromExternalEntry(entry: ConceptMapCacheEntry, system?: string): ConceptMapTranslationResult {
-    if (entry.status === 'not-found') return { status: 'unmapped', reason: 'no-source-code' };
+    if (entry.status === 'not-found') return { status: 'unmapped', reason: 'code-not-in-conceptmap' };
     const map = entry.bySourceSystem || {};
     const sourceSystems = Object.keys(map);
     if (system) {
@@ -1377,7 +1377,7 @@ export class FhirTerminologyRuntime {
     if (!external) return;
     try {
       if (result.status === 'unmapped') {
-        if (result.reason === 'no-source-code') {
+        if (result.reason === 'code-not-in-conceptmap') {
           await external.setCode(cmKey, code, { status: 'not-found' });
           return;
         }

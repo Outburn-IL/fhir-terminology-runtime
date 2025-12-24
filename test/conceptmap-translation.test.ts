@@ -767,7 +767,7 @@ describe('translateConceptMap (unit)', () => {
     expect(getCount).toBeGreaterThan(0);
   });
 
-  it('returns no-source-code from external cache when entry is not-found', async () => {
+  it('returns code-not-in-conceptmap from external cache when entry is not-found', async () => {
     const externalStore = new Map<string, any>();
 
     const conceptMapCache: any = {
@@ -808,7 +808,7 @@ describe('translateConceptMap (unit)', () => {
     });
 
     const r = await ftrExternalOnly.translateConceptMap('Z', 'cm-small');
-    expect(r).toEqual({ status: 'unmapped', reason: 'no-source-code' });
+    expect(r).toEqual({ status: 'unmapped', reason: 'code-not-in-conceptmap' });
   });
 
   it('prefers server ConceptMap over package ConceptMap when fhirClient is provided', async () => {

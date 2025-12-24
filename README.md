@@ -251,7 +251,7 @@ Output:
 - When `status === 'unmapped'`, `reason` explains why no targets were returned.
 
 Unmapped reasons:
-- `no-source-code`: the source code is not present in the ConceptMap.
+- `code-not-in-conceptmap`: the source code is not present in the ConceptMap.
 - `no-translation`: the source code exists, but no translation exists for the requested source system (or the mapping is empty).
 - `unsupported-equivalence`: a mapping exists, but all targets were ignored because their `equivalence` values are unsupported. In this case, `ignoredEquivalences` is included.
 - `duplicate-code`: returned only for **code-only** lookups when the same code exists under **multiple source systems** in the ConceptMap.

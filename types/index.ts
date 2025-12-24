@@ -128,7 +128,7 @@ export type ConceptMapTranslation = ConceptProps & {
 export type ConceptMapUnmappedReason =
   | 'unknown-conceptmap'
   | 'duplicate-code'
-  | 'no-source-code'
+  | 'code-not-in-conceptmap'
   | 'no-translation'
   | 'unsupported-equivalence'
   | 'invalid-code';
