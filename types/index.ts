@@ -7,6 +7,25 @@
 import { FhirPackageExplorer } from 'fhir-package-explorer';
 import { FhirVersion, Logger } from '@outburn/types';
 
+/**
+ * Minimal interface for an injected FHIR client used by FhirTerminologyRuntime.
+ *
+ * This runtime only uses it for resolving ConceptMap resources from a server.
+ * The shape matches @outburn/fhir-client's resolve/getBaseUrl surface.
+ */
+export type TerminologyFhirClient = {
+  /**
+   * Resolve a single resource.
+   *
+   * Examples:
+   * - resolve('ConceptMap/123')
+   * - resolve('ConceptMap', { url: 'http://...' })
+   */
+  resolve: (resourceOrLiteral: string, searchParams?: Record<string, any>, options?: Record<string, any>) => Promise<any>;
+  /** Returns the configured server base URL. */
+  getBaseUrl: () => string;
+};
+
 export type Prethrower = (msg: Error | any) => Error;
 
 /**
@@ -57,6 +76,14 @@ export type TerminologyRuntimeConfig = {
    * Used by FhirTerminologyRuntime.translateConceptMap for high-performance lookups.
    */
   conceptMapCache?: TerminologyConceptMapCache;
+
+  /**
+   * Optional injected FHIR client.
+   *
+   * When provided (and when packageFilter is NOT provided), translateConceptMap
+   * will prefer resolving ConceptMaps from the server before falling back to packages.
+   */
+  fhirClient?: TerminologyFhirClient;
 };
 
 export type UnknownReason =
@@ -159,7 +186,14 @@ export interface TerminologyConceptMapCache {
   setCode(cm: ConceptMapDeterministicKey, code: string, entry: ConceptMapCacheEntry): Promise<void>;
 
   bulkSetCodes?(cm: ConceptMapDeterministicKey, entries: Array<[string, ConceptMapCacheEntry]>): Promise<void>;
-  clearNamespace(cm: ConceptMapDeterministicKey): Promise<void>;
+  /**
+   * Clears all cached entries under a namespace prefix.
+   *
+   * The runtime uses deterministic, prefix-friendly namespaces, e.g.:
+   * - server: `server:${baseUrl}/ConceptMap/`
+   * - package: `package:${packageId}#${packageVersion}::${filename}`
+   */
+  clearNamespace(namespacePrefix: string): Promise<void>;
 }
 
 export type MembershipCacheEntry =

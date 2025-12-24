@@ -255,8 +255,9 @@ Unmapped reasons:
 - `no-translation`: the source code exists, but no translation exists for the requested source system (or the mapping is empty).
 - `unsupported-equivalence`: a mapping exists, but all targets were ignored because their `equivalence` values are unsupported. In this case, `ignoredEquivalences` is included.
 - `duplicate-code`: returned only for **code-only** lookups when the same code exists under **multiple source systems** in the ConceptMap.
-- `unknown-conceptmap`: the ConceptMap identifier could not be resolved or loaded.
 - `invalid-code`: the input code was empty.
+
+Note: if the ConceptMap identifier cannot be resolved or the ConceptMap cannot be loaded, `translateConceptMap` throws.
 
 ### Equivalence handling
 
@@ -276,6 +277,26 @@ Any other equivalence value is ignored.
 
 All `ConceptMap.group[]` entries are treated as a single flattened mapping.
 Group boundaries have no semantic meaning for translation in this runtime.
+
+### Server ConceptMaps (optional `fhirClient`)
+
+If you provide a `fhirClient` to `FhirTerminologyRuntime.create(...)`, `translateConceptMap` can resolve ConceptMaps from a FHIR server.
+
+- When `conceptMap` is a string and `packageFilter` is **not** provided, the runtime tries the server first and then falls back to packages.
+- When `packageFilter` is provided, the runtime skips server resolution and uses packages only.
+
+Server resolution attempts (in order):
+- `ConceptMap?url={identifier}`
+- `ConceptMap/{identifier}`
+- `ConceptMap?name={identifier}`
+
+If the server ConceptMaps may change at runtime, you can clear cached server ConceptMaps:
+
+```ts
+await ftr.clearServerConceptMapsFromCache();
+// or clear for a specific server base URL
+await ftr.clearServerConceptMapsFromCache('https://example.org/fhir');
+```
 
 ### Translation caching (`conceptMapCache`)
 
@@ -299,7 +320,7 @@ const ftr = await FhirTerminologyRuntime.create({
 The external ConceptMap cache is keyed by a deterministic ConceptMap namespace:
 
 - Package ConceptMaps: `(packageId, packageVersion, filename)`
-- Server ConceptMaps: reserved for future support (keyed by server base URL + ConceptMap canonical URL)
+- Server ConceptMaps: (keyed by server base URL + ConceptMap URL)
 
 Interface (simplified):
 
@@ -329,13 +350,14 @@ interface TerminologyConceptMapCache {
 
   bulkSetCodes?(cm: ConceptMapDeterministicKey, entries: Array<[string, ConceptMapCacheEntry]>): Promise<void>;
 
-  // Required: used for future server-based reload operations
-  clearNamespace(cm: ConceptMapDeterministicKey): Promise<void>;
+  // Required: used for package reinstall / server ConceptMap reload operations
+  clearNamespace(namespacePrefix: string): Promise<void>;
 }
 ```
 
 Implementation note for cache authors:
-- Use a clear namespace prefix (for example `cm:pkg:` vs `cm:srv:`) so you can safely store both package-based and future server-based entries.
+- FTR provides the `namespacePrefix` string to `clearNamespace(...)`.
+- Your implementation does **not** need to invent prefixes, but it **must** store keys in a way that preserves the prefix so prefix-clearing is possible (for example, avoid hashing the entire key in a way that prevents enumerating/deleting by prefix).
 
 FTR supports two ways to track this state:
 

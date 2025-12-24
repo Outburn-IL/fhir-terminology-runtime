@@ -207,10 +207,9 @@ describe('translateConceptMap (unit)', () => {
           await conceptMapCache.setCode(cmKey, code, entry);
         }
       },
-      clearNamespace: async (cmKey: any) => {
-        const ns = `${cmKey.kind}:${cmKey.kind === 'package' ? `${cmKey.packageId}#${cmKey.packageVersion}::${cmKey.filename}` : `${cmKey.serverBaseUrl}::${cmKey.url}`}`;
+      clearNamespace: async (namespacePrefix: string) => {
         for (const k of Array.from(externalStore.keys())) {
-          if (k.startsWith(`${ns}|`)) externalStore.delete(k);
+          if (k.startsWith(namespacePrefix)) externalStore.delete(k);
         }
       }
     };
@@ -625,7 +624,7 @@ describe('translateConceptMap (unit)', () => {
     expect(resolveCalls).toBe(0);
   });
 
-  it('returns unknown-conceptmap when resolved resource is not a ConceptMap', async () => {
+  it('throws when resolved resource is not a ConceptMap', async () => {
     const fpeStub: any = {
       getCachePath: () => 'C:/tmp/fhir-cache',
       getContextPackages: () => [],
@@ -644,11 +643,10 @@ describe('translateConceptMap (unit)', () => {
       fhirVersion: '4.0.1'
     });
 
-    const r = await ftrLocal.translateConceptMap('A', 'cm-small');
-    expect(r).toEqual({ status: 'unmapped', reason: 'unknown-conceptmap' });
+    await expect(() => ftrLocal.translateConceptMap('A', 'cm-small')).rejects.toBeTruthy();
   });
 
-  it('returns unknown-conceptmap when ConceptMap resolve returns undefined', async () => {
+  it('throws when ConceptMap load returns undefined', async () => {
     const fpeStub: any = {
       getCachePath: () => 'C:/tmp/fhir-cache',
       getContextPackages: () => [],
@@ -667,11 +665,10 @@ describe('translateConceptMap (unit)', () => {
       fhirVersion: '4.0.1'
     });
 
-    const r = await ftrLocal.translateConceptMap('A', 'cm-small');
-    expect(r).toEqual({ status: 'unmapped', reason: 'unknown-conceptmap' });
+    await expect(() => ftrLocal.translateConceptMap('A', 'cm-small')).rejects.toBeTruthy();
   });
 
-  it('returns unknown-conceptmap for unknown ConceptMap identifiers', async () => {
+  it('throws for unknown ConceptMap identifiers', async () => {
     const fpeStub: any = {
       getCachePath: () => 'C:/tmp/fhir-cache',
       getContextPackages: () => [],
@@ -690,8 +687,31 @@ describe('translateConceptMap (unit)', () => {
       fhirVersion: '4.0.1'
     });
 
-    const r = await ftrLocal.translateConceptMap('A', 'does-not-exist');
-    expect(r).toEqual({ status: 'unmapped', reason: 'unknown-conceptmap' });
+    await expect(() => ftrLocal.translateConceptMap('A', 'does-not-exist')).rejects.toBeTruthy();
+  });
+
+  it('throws for unknown ConceptMap URL identifiers (url branch)', async () => {
+    const fpeStub: any = {
+      getCachePath: () => 'C:/tmp/fhir-cache',
+      getContextPackages: () => [],
+      resolveMeta: async () => {
+        throw new Error('Not found');
+      },
+      resolve: async () => {
+        throw new Error('Not found');
+      },
+      lookupMeta: async () => []
+    };
+
+    const ftrLocal = await FhirTerminologyRuntime.create({
+      fpe: fpeStub,
+      cacheMode: 'lazy',
+      fhirVersion: '4.0.1'
+    });
+
+    await expect(() =>
+      ftrLocal.translateConceptMap('A', 'http://example.org/ConceptMap/does-not-exist')
+    ).rejects.toBeTruthy();
   });
 
   it('uses hot per-code LRU for large ConceptMaps', async () => {
@@ -789,5 +809,472 @@ describe('translateConceptMap (unit)', () => {
 
     const r = await ftrExternalOnly.translateConceptMap('Z', 'cm-small');
     expect(r).toEqual({ status: 'unmapped', reason: 'no-source-code' });
+  });
+
+  it('prefers server ConceptMap over package ConceptMap when fhirClient is provided', async () => {
+    const fpeStub: any = {
+      getCachePath: () => 'C:/tmp/fhir-cache',
+      getContextPackages: () => [],
+      resolveMeta: async (query: any) => {
+        if (query.resourceType !== 'ConceptMap') throw new Error('Unsupported');
+        if (query.id && metaByIdentifier[query.id]) return metaByIdentifier[query.id];
+        throw new Error('Not found');
+      },
+      resolve: async ({ filename }: any) => conceptMaps[filename],
+      lookupMeta: async () => []
+    };
+
+    const serverConceptMap = {
+      resourceType: 'ConceptMap',
+      id: 'cm-small',
+      url: 'http://example.org/ConceptMap/cm-small',
+      group: [
+        {
+          source: 'http://example.org/system/source',
+          target: 'http://example.org/system/target',
+          element: [{ code: 'A', target: [{ code: 'S1', equivalence: 'equivalent' }] }]
+        }
+      ]
+    };
+
+    const fhirClientStub: any = {
+      getBaseUrl: () => 'https://fhir.example.org',
+      resolve: async (resourceOrLiteral: string, searchParams?: any) => {
+        if (resourceOrLiteral === 'ConceptMap' && searchParams?.url === 'cm-small') throw new Error('not found');
+        if (resourceOrLiteral === 'ConceptMap' && searchParams?.url === 'http://example.org/ConceptMap/cm-small') return serverConceptMap;
+        if (resourceOrLiteral === 'ConceptMap' && searchParams?.name === 'cm-small') throw new Error('not found');
+        if (resourceOrLiteral === 'ConceptMap/cm-small') return serverConceptMap;
+        throw new Error('not found');
+      }
+    };
+
+    const ftrLocal = await FhirTerminologyRuntime.create({
+      fpe: fpeStub,
+      cacheMode: 'lazy',
+      fhirVersion: '4.0.1',
+      fhirClient: fhirClientStub
+    });
+
+    const r = await ftrLocal.translateConceptMap('A', 'cm-small');
+    expect(r.status).toBe('mapped');
+    if (r.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r.targets.map(t => t.code)).toEqual(['S1']);
+  });
+
+  it('skips server ConceptMap resolution when packageFilter is provided', async () => {
+    const fpeStub: any = {
+      getCachePath: () => 'C:/tmp/fhir-cache',
+      getContextPackages: () => [],
+      resolveMeta: async (query: any) => {
+        if (query.resourceType !== 'ConceptMap') throw new Error('Unsupported');
+        if (query.id && metaByIdentifier[query.id]) return metaByIdentifier[query.id];
+        throw new Error('Not found');
+      },
+      resolve: async ({ filename }: any) => conceptMaps[filename],
+      lookupMeta: async () => []
+    };
+
+    let serverResolveCalls = 0;
+    const fhirClientStub: any = {
+      getBaseUrl: () => 'https://fhir.example.org',
+      resolve: async () => {
+        serverResolveCalls++;
+        throw new Error('should not be called');
+      }
+    };
+
+    const ftrLocal = await FhirTerminologyRuntime.create({
+      fpe: fpeStub,
+      cacheMode: 'lazy',
+      fhirVersion: '4.0.1',
+      fhirClient: fhirClientStub
+    });
+
+    const r = await ftrLocal.translateConceptMap('A', 'cm-small', { id: 'some.pkg', version: '1.0.0' });
+    expect(r.status).toBe('mapped');
+    if (r.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r.targets.map(t => t.code)).toContain('1');
+    expect(serverResolveCalls).toBe(0);
+  });
+
+  it('clears server ConceptMap entries from external cache via clearServerConceptMapsFromCache()', async () => {
+    const externalStore = new Map<string, any>();
+    const conceptMapCache: any = {
+      getCode: async () => undefined,
+      setCode: async () => undefined,
+      clearNamespace: async (prefix: string) => {
+        for (const k of Array.from(externalStore.keys())) {
+          if (k.startsWith(prefix)) externalStore.delete(k);
+        }
+      }
+    };
+
+    // Seed some server-ish entries
+    externalStore.set('server:https://fhir.example.org|A', { status: 'found' });
+    externalStore.set('server:https://fhir.example.org/ConceptMap/cm-small|B', { status: 'found' });
+    externalStore.set('package:test.pkg#1.0.0::cm-small.json|A', { status: 'found' });
+
+    const fpeStub: any = {
+      getCachePath: () => 'C:/tmp/fhir-cache',
+      getContextPackages: () => [],
+      resolveMeta: async () => {
+        throw new Error('Not found');
+      },
+      resolve: async () => {
+        throw new Error('Not found');
+      },
+      lookupMeta: async () => []
+    };
+
+    const fhirClientStub: any = {
+      getBaseUrl: () => 'https://fhir.example.org',
+      resolve: async () => {
+        throw new Error('not used');
+      }
+    };
+
+    const ftrLocal = await FhirTerminologyRuntime.create({
+      fpe: fpeStub,
+      cacheMode: 'lazy',
+      fhirVersion: '4.0.1',
+      conceptMapCache,
+      fhirClient: fhirClientStub
+    });
+
+    await ftrLocal.clearServerConceptMapsFromCache();
+
+    expect(Array.from(externalStore.keys()).some(k => k.startsWith('server:https://fhir.example.org'))).toBe(false);
+    expect(Array.from(externalStore.keys()).some(k => k.startsWith('package:'))).toBe(true);
+  });
+
+  it('clears server ConceptMap entries from internal LRUs and re-resolves after clearing', async () => {
+    const fpeStub: any = {
+      getCachePath: () => 'C:/tmp/fhir-cache',
+      getContextPackages: () => [],
+      resolveMeta: async (query: any) => {
+        if (query.resourceType !== 'ConceptMap') throw new Error('Unsupported');
+        if (query.id && metaByIdentifier[query.id]) return metaByIdentifier[query.id];
+        throw new Error('Not found');
+      },
+      resolve: async ({ filename }: any) => conceptMaps[filename],
+      lookupMeta: async () => []
+    };
+
+    const serverConceptMap = {
+      resourceType: 'ConceptMap',
+      id: 'cm-small',
+      url: 'http://example.org/ConceptMap/cm-small',
+      group: [
+        {
+          source: 'http://example.org/system/source',
+          target: 'http://example.org/system/target',
+          element: [{ code: 'A', target: [{ code: 'S1', equivalence: 'equivalent' }] }]
+        }
+      ]
+    };
+
+    let serverResolveCalls = 0;
+    const fhirClientStub: any = {
+      getBaseUrl: () => 'https://fhir.example.org',
+      resolve: async (resourceOrLiteral: string, searchParams?: any) => {
+        serverResolveCalls++;
+        if (resourceOrLiteral === 'ConceptMap' && searchParams?.url === 'cm-small') throw new Error('not found');
+        if (resourceOrLiteral === 'ConceptMap' && searchParams?.name === 'cm-small') throw new Error('not found');
+        if (resourceOrLiteral === 'ConceptMap/cm-small') return serverConceptMap;
+        throw new Error('not found');
+      }
+    };
+
+    const ftrLocal = await FhirTerminologyRuntime.create({
+      fpe: fpeStub,
+      cacheMode: 'lazy',
+      fhirVersion: '4.0.1',
+      fhirClient: fhirClientStub
+    });
+
+    // Seed both server + package entries to ensure deleteWhere sees both true/false predicate cases.
+    await ftrLocal.translateConceptMap('A', 'cm-small');
+    await ftrLocal.translateConceptMap('A', 'cm-small', { id: 'some.pkg', version: '1.0.0' });
+
+    const callsAfterFirst = serverResolveCalls;
+    await ftrLocal.clearServerConceptMapsFromCache('https://fhir.example.org');
+    await ftrLocal.translateConceptMap('A', 'cm-small');
+
+    expect(serverResolveCalls).toBeGreaterThan(callsAfterFirst);
+  });
+
+  it('honors server ConceptMap changes only after clearing server cache', async () => {
+    const packageConceptMap = {
+      resourceType: 'ConceptMap',
+      id: 'cm-dynamic',
+      url: 'http://example.org/ConceptMap/cm-dynamic',
+      group: [
+        {
+          source: 'http://example.org/system/source',
+          target: 'http://example.org/system/target',
+          element: [{ code: 'A', target: [{ code: 'P1', equivalence: 'equivalent' }] }]
+        }
+      ]
+    };
+
+    const packageMeta: any = {
+      'cm-dynamic': {
+        resourceType: 'ConceptMap',
+        filename: 'cm-dynamic.json',
+        __packageId: pkg.id,
+        __packageVersion: pkg.version
+      }
+    };
+
+    const fpeStub: any = {
+      getCachePath: () => 'C:/tmp/fhir-cache',
+      getContextPackages: () => [],
+      resolveMeta: async (query: any) => {
+        if (query.resourceType !== 'ConceptMap') throw new Error('Unsupported');
+        if (query.id && packageMeta[query.id]) return packageMeta[query.id];
+        throw new Error('Not found');
+      },
+      resolve: async ({ filename }: any) => {
+        if (filename === 'cm-dynamic.json') return packageConceptMap;
+        throw new Error('Not found');
+      },
+      lookupMeta: async () => []
+    };
+
+    let serverState: 'v1' | 'v2' = 'v1';
+    let serverResolveCalls = 0;
+
+    const serverConceptMapV1 = {
+      resourceType: 'ConceptMap',
+      id: 'cm-dynamic',
+      url: 'http://example.org/ConceptMap/cm-dynamic',
+      group: [
+        {
+          source: 'http://example.org/system/source',
+          target: 'http://example.org/system/target',
+          element: [{ code: 'A', target: [{ code: 'S1', equivalence: 'equivalent' }] }]
+        }
+      ]
+    };
+    const serverConceptMapV2 = {
+      resourceType: 'ConceptMap',
+      id: 'cm-dynamic',
+      url: 'http://example.org/ConceptMap/cm-dynamic',
+      group: [
+        {
+          source: 'http://example.org/system/source',
+          target: 'http://example.org/system/target',
+          element: [{ code: 'A', target: [{ code: 'S2', equivalence: 'equivalent' }] }]
+        }
+      ]
+    };
+
+    const fhirClientStub: any = {
+      getBaseUrl: () => 'https://fhir.example.org',
+      resolve: async (resourceOrLiteral: string, searchParams?: any) => {
+        serverResolveCalls++;
+
+        const shouldReturn =
+          (resourceOrLiteral === 'ConceptMap' && searchParams?.url === 'cm-dynamic') ||
+          resourceOrLiteral === 'ConceptMap/cm-dynamic';
+
+        if (!shouldReturn) throw new Error('not found');
+        return serverState === 'v1' ? serverConceptMapV1 : serverConceptMapV2;
+      }
+    };
+
+    const ftrLocal = await FhirTerminologyRuntime.create({
+      fpe: fpeStub,
+      cacheMode: 'lazy',
+      fhirVersion: '4.0.1',
+      fhirClient: fhirClientStub
+    });
+
+    const r1 = await ftrLocal.translateConceptMap('A', 'cm-dynamic');
+    expect(r1.status).toBe('mapped');
+    if (r1.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r1.targets.map(t => t.code)).toEqual(['S1']);
+
+    const callsAfterFirst = serverResolveCalls;
+    serverState = 'v2';
+
+    // Without clearing, we should keep using the cached in-memory index.
+    const r2 = await ftrLocal.translateConceptMap('A', 'cm-dynamic');
+    expect(r2.status).toBe('mapped');
+    if (r2.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r2.targets.map(t => t.code)).toEqual(['S1']);
+    expect(serverResolveCalls).toBe(callsAfterFirst);
+
+    // After clearing, the runtime should re-resolve and use the new server state.
+    await ftrLocal.clearServerConceptMapsFromCache();
+    const r3 = await ftrLocal.translateConceptMap('A', 'cm-dynamic');
+    expect(r3.status).toBe('mapped');
+    if (r3.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r3.targets.map(t => t.code)).toEqual(['S2']);
+    expect(serverResolveCalls).toBeGreaterThan(callsAfterFirst);
+  });
+
+  it('honors server ConceptMap deletion after clearing: falls back to package ConceptMap', async () => {
+    const packageConceptMap = {
+      resourceType: 'ConceptMap',
+      id: 'cm-dynamic',
+      url: 'http://example.org/ConceptMap/cm-dynamic',
+      group: [
+        {
+          source: 'http://example.org/system/source',
+          target: 'http://example.org/system/target',
+          element: [{ code: 'A', target: [{ code: 'P1', equivalence: 'equivalent' }] }]
+        }
+      ]
+    };
+
+    const packageMeta: any = {
+      'cm-dynamic': {
+        resourceType: 'ConceptMap',
+        filename: 'cm-dynamic.json',
+        __packageId: pkg.id,
+        __packageVersion: pkg.version
+      }
+    };
+
+    const fpeStub: any = {
+      getCachePath: () => 'C:/tmp/fhir-cache',
+      getContextPackages: () => [],
+      resolveMeta: async (query: any) => {
+        if (query.resourceType !== 'ConceptMap') throw new Error('Unsupported');
+        if (query.id && packageMeta[query.id]) return packageMeta[query.id];
+        throw new Error('Not found');
+      },
+      resolve: async ({ filename }: any) => {
+        if (filename === 'cm-dynamic.json') return packageConceptMap;
+        throw new Error('Not found');
+      },
+      lookupMeta: async () => []
+    };
+
+    let serverState: 'present' | 'deleted' = 'present';
+
+    const serverConceptMap = {
+      resourceType: 'ConceptMap',
+      id: 'cm-dynamic',
+      url: 'http://example.org/ConceptMap/cm-dynamic',
+      group: [
+        {
+          source: 'http://example.org/system/source',
+          target: 'http://example.org/system/target',
+          element: [{ code: 'A', target: [{ code: 'S1', equivalence: 'equivalent' }] }]
+        }
+      ]
+    };
+
+    let serverResolveCalls = 0;
+    const fhirClientStub: any = {
+      getBaseUrl: () => 'https://fhir.example.org',
+      resolve: async (resourceOrLiteral: string, searchParams?: any) => {
+        serverResolveCalls++;
+        if (serverState === 'deleted') throw new Error('not found');
+
+        const shouldReturn =
+          (resourceOrLiteral === 'ConceptMap' && searchParams?.url === 'cm-dynamic') ||
+          resourceOrLiteral === 'ConceptMap/cm-dynamic';
+
+        if (!shouldReturn) throw new Error('not found');
+        return serverConceptMap;
+      }
+    };
+
+    const ftrLocal = await FhirTerminologyRuntime.create({
+      fpe: fpeStub,
+      cacheMode: 'lazy',
+      fhirVersion: '4.0.1',
+      fhirClient: fhirClientStub
+    });
+
+    const r1 = await ftrLocal.translateConceptMap('A', 'cm-dynamic');
+    expect(r1.status).toBe('mapped');
+    if (r1.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r1.targets.map(t => t.code)).toEqual(['S1']);
+
+    const callsAfterFirst = serverResolveCalls;
+    serverState = 'deleted';
+
+    // Without clearing, still uses cached server index.
+    const r2 = await ftrLocal.translateConceptMap('A', 'cm-dynamic');
+    expect(r2.status).toBe('mapped');
+    if (r2.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r2.targets.map(t => t.code)).toEqual(['S1']);
+    expect(serverResolveCalls).toBe(callsAfterFirst);
+
+    // After clearing, server resolution fails and we should fall back to package ConceptMap.
+    await ftrLocal.clearServerConceptMapsFromCache();
+    const r3 = await ftrLocal.translateConceptMap('A', 'cm-dynamic');
+    expect(r3.status).toBe('mapped');
+    if (r3.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r3.targets.map(t => t.code)).toEqual(['P1']);
+    expect(serverResolveCalls).toBeGreaterThan(callsAfterFirst);
+  });
+
+  it('honors server ConceptMap deletion after clearing: throws when no package fallback exists', async () => {
+    const fpeStub: any = {
+      getCachePath: () => 'C:/tmp/fhir-cache',
+      getContextPackages: () => [],
+      resolveMeta: async () => {
+        throw new Error('Not found');
+      },
+      resolve: async () => {
+        throw new Error('Not found');
+      },
+      lookupMeta: async () => []
+    };
+
+    let serverState: 'present' | 'deleted' = 'present';
+    const serverConceptMap = {
+      resourceType: 'ConceptMap',
+      id: 'cm-dynamic',
+      url: 'http://example.org/ConceptMap/cm-dynamic',
+      group: [
+        {
+          source: 'http://example.org/system/source',
+          target: 'http://example.org/system/target',
+          element: [{ code: 'A', target: [{ code: 'S1', equivalence: 'equivalent' }] }]
+        }
+      ]
+    };
+
+    const fhirClientStub: any = {
+      getBaseUrl: () => 'https://fhir.example.org',
+      resolve: async (resourceOrLiteral: string, searchParams?: any) => {
+        if (serverState === 'deleted') throw new Error('not found');
+        const shouldReturn =
+          (resourceOrLiteral === 'ConceptMap' && searchParams?.url === 'cm-dynamic') ||
+          resourceOrLiteral === 'ConceptMap/cm-dynamic';
+        if (!shouldReturn) throw new Error('not found');
+        return serverConceptMap;
+      }
+    };
+
+    const ftrLocal = await FhirTerminologyRuntime.create({
+      fpe: fpeStub,
+      cacheMode: 'lazy',
+      fhirVersion: '4.0.1',
+      fhirClient: fhirClientStub
+    });
+
+    // Prime the cached server ConceptMap.
+    const r1 = await ftrLocal.translateConceptMap('A', 'cm-dynamic');
+    expect(r1.status).toBe('mapped');
+    if (r1.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r1.targets.map(t => t.code)).toEqual(['S1']);
+
+    // Delete on server, but cached index still works.
+    serverState = 'deleted';
+    const r2 = await ftrLocal.translateConceptMap('A', 'cm-dynamic');
+    expect(r2.status).toBe('mapped');
+    if (r2.status !== 'mapped') throw new Error('Expected mapped');
+    expect(r2.targets.map(t => t.code)).toEqual(['S1']);
+
+    // After clearing, both server and package resolution fail -> should throw.
+    await ftrLocal.clearServerConceptMapsFromCache();
+    await expect(() => ftrLocal.translateConceptMap('A', 'cm-dynamic')).rejects.toBeTruthy();
   });
 });

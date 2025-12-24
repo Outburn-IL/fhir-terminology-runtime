@@ -43,7 +43,8 @@ import type {
   ConceptMapCacheEntry,
   ConceptMapTranslation,
   ConceptMapTranslationResult,
-  SupportedConceptMapEquivalence
+  SupportedConceptMapEquivalence,
+  TerminologyFhirClient
 } from '../types';
 
 const versionedCacheDir = `v${ftrVersion.split('.').slice(0, 2).join('.')}.x`;
@@ -84,6 +85,8 @@ export class FhirTerminologyRuntime {
   private membershipCache?: TerminologyMembershipCache;
   private conceptMapCache?: TerminologyConceptMapCache;
 
+  private fhirClient?: TerminologyFhirClient;
+
   // Cache for resolving ValueSet identifiers (url/id/name) -> metadata.
   // Keyed by identifier + packageFilter.
   private valueSetIdentifierMetaCache: Map<string, Promise<FileIndexEntryWithPkg>> = new Map();
@@ -111,13 +114,18 @@ export class FhirTerminologyRuntime {
   // Keyed by identifier + packageFilter.
   private conceptMapIdentifierMetaCache: Map<string, Promise<FileIndexEntryWithPkg>> = new Map();
 
+  // Cache for resolving server ConceptMap identifiers (url/id/name) -> deterministic server key.
+  // Keyed by baseUrl + identifier.
+  private serverConceptMapIdentifierKeyCache: Map<string, Promise<ConceptMapDeterministicKey>> = new Map();
+
   private constructor(
     fpe: FhirPackageExplorer,
     cacheMode: TerminologyCacheMode,
     fhirVersion: FhirVersion,
     logger?: Logger,
     membershipCache?: TerminologyMembershipCache,
-    conceptMapCache?: TerminologyConceptMapCache
+    conceptMapCache?: TerminologyConceptMapCache,
+    fhirClient?: TerminologyFhirClient
   ) {
     if (logger) {
       this.logger = logger;
@@ -132,6 +140,7 @@ export class FhirTerminologyRuntime {
     this.cachePath = fpe.getCachePath();
     this.membershipCache = membershipCache;
     this.conceptMapCache = conceptMapCache;
+    this.fhirClient = fhirClient;
   };
 
   /**
@@ -159,7 +168,8 @@ export class FhirTerminologyRuntime {
         fhirVersion,
         config.logger,
         config.membershipCache,
-        config.conceptMapCache
+        config.conceptMapCache,
+        config.fhirClient
       );
 
       let precache: boolean = false;
@@ -296,12 +306,136 @@ export class FhirTerminologyRuntime {
     return { kind: 'package', packageId, packageVersion, filename };
   }
 
+  private normalizeServerBaseUrl(baseUrl: string): string {
+    return (baseUrl || '').trim().replace(/\/+$/, '');
+  }
+
+  private getServerConceptMapNamespace(serverBaseUrl: string): string {
+    const base = this.normalizeServerBaseUrl(serverBaseUrl);
+    return `server:${base}`;
+  }
+
+  private toServerConceptMapKeyFromId(serverBaseUrl: string, idOrToken: string): ConceptMapDeterministicKey {
+    const base = this.normalizeServerBaseUrl(serverBaseUrl);
+    const safe = (idOrToken || '').trim();
+    return {
+      kind: 'server',
+      serverBaseUrl: base,
+      url: `${base}/ConceptMap/${safe}`
+    };
+  }
+
+  private getConceptMapIdFromServerKey(cmKey: Extract<ConceptMapDeterministicKey, { kind: 'server' }>): string | undefined {
+    const match = cmKey.url.match(/\/ConceptMap\/([^/?#]+)/);
+    return match?.[1];
+  }
+
   private toConceptMapKeyString(cmKey: ConceptMapDeterministicKey): string {
     if (cmKey.kind === 'package') {
       return `package:${cmKey.packageId}#${cmKey.packageVersion}::${cmKey.filename}`;
     }
-    /* c8 ignore next 2 */
-    return `server:${cmKey.serverBaseUrl}::${cmKey.url}`;
+    return `server:${cmKey.url}`;
+  }
+
+  private async resolveServerConceptMapKey(identifier: string, serverBaseUrl: string, errors: unknown[]): Promise<ConceptMapDeterministicKey | undefined> {
+    const client = this.fhirClient;
+    if (!client) return undefined;
+
+    const base = this.normalizeServerBaseUrl(serverBaseUrl);
+    const cacheKey = this.stableStringify({ base, identifier });
+    const cached = this.serverConceptMapIdentifierKeyCache.get(cacheKey);
+    if (cached) {
+      try {
+        return await cached;
+      } catch (e) {
+        this.serverConceptMapIdentifierKeyCache.delete(cacheKey);
+        errors.push(e);
+      }
+    }
+
+    const promise = (async () => {
+      // Order: url, id, name
+      const attempts: Array<() => Promise<any>> = [
+        () => client.resolve('ConceptMap', { url: identifier }),
+        () => client.resolve(`ConceptMap/${identifier}`),
+        () => client.resolve('ConceptMap', { name: identifier })
+      ];
+
+      const localErrors: unknown[] = [];
+      for (const attempt of attempts) {
+        try {
+          const cm = await attempt();
+          if (!cm || cm.resourceType !== 'ConceptMap') {
+            throw new Error(`Resolved resource is not a ConceptMap (got '${cm?.resourceType || 'unknown'}').`);
+          }
+
+          const id = typeof cm.id === 'string' && cm.id.length > 0 ? cm.id : undefined;
+          const token = id || (typeof cm.url === 'string' && cm.url.length ? encodeURIComponent(cm.url) : encodeURIComponent(identifier));
+          return this.toServerConceptMapKeyFromId(base, token);
+        } catch (e) {
+          localErrors.push(e);
+        }
+      }
+      const err: any = new Error(`Failed to resolve server ConceptMap '${identifier}'.`);
+      err.errors = localErrors;
+      throw err;
+    })();
+
+    this.serverConceptMapIdentifierKeyCache.set(cacheKey, promise);
+    try {
+      return await promise;
+    } catch (e) {
+      this.serverConceptMapIdentifierKeyCache.delete(cacheKey);
+      errors.push(e);
+      return undefined;
+    }
+  }
+
+  private async loadConceptMapResource(cmKey: ConceptMapDeterministicKey): Promise<any> {
+    if (cmKey.kind === 'package') {
+      return await this.getConceptMapByFileName(cmKey.filename, cmKey.packageId, cmKey.packageVersion);
+    }
+    const client = this.fhirClient;
+    if (!client) throw new Error('FHIR client not configured for server ConceptMap resolution.');
+    const id = this.getConceptMapIdFromServerKey(cmKey);
+    if (!id) throw new Error(`Invalid server ConceptMap key url '${cmKey.url}' (cannot extract id).`);
+    return await client.resolve(`ConceptMap/${id}`);
+  }
+
+  public async clearServerConceptMapsFromCache(serverBaseUrl?: string): Promise<void> {
+    const prefixes: string[] = [];
+    if (serverBaseUrl) {
+      prefixes.push(this.getServerConceptMapNamespace(serverBaseUrl));
+    } else if (this.fhirClient) {
+      prefixes.push(this.getServerConceptMapNamespace(this.fhirClient.getBaseUrl()));
+    } else {
+      // No base URL available: clear all server-prefixed entries.
+      prefixes.push('server:');
+    }
+
+    for (const prefix of prefixes) {
+      this.smallConceptMapIndexLru.deleteWhere(k => typeof k === 'string' && k.startsWith(prefix));
+      this.conceptMapResultLru.deleteWhere(k => typeof k === 'string' && k.startsWith(prefix));
+
+      for (const key of Array.from(this.externallyPrimedConceptMaps.values())) {
+        if (key.startsWith(prefix)) this.externallyPrimedConceptMaps.delete(key);
+      }
+
+      const baseToMatch = prefix.startsWith('server:') ? prefix.slice('server:'.length) : '';
+      for (const cacheKey of Array.from(this.serverConceptMapIdentifierKeyCache.keys())) {
+        if (!baseToMatch || cacheKey.includes(`"base":"${baseToMatch}"`)) {
+          this.serverConceptMapIdentifierKeyCache.delete(cacheKey);
+        }
+      }
+
+      if (this.conceptMapCache) {
+        try {
+          await this.conceptMapCache.clearNamespace(prefix);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
   }
 
   private async getConceptMapMetadata(identifier: string, packageFilter?: FhirPackageIdentifier): Promise<FileIndexEntryWithPkg> {
@@ -1023,20 +1157,49 @@ export class FhirTerminologyRuntime {
     const { code, system } = this.normalizeCodeOrCoding(codeOrCoding);
     if (!code) return { status: 'unmapped', reason: 'invalid-code' };
 
-    let meta: FileIndexEntryWithPkg;
-    try {
-      meta = typeof conceptMap === 'string' ? await this.getConceptMapMetadata(conceptMap, packageFilter) : conceptMap;
-      if (!meta) return { status: 'unmapped', reason: 'unknown-conceptmap' };
-    } catch {
-      return { status: 'unmapped', reason: 'unknown-conceptmap' };
+    const errors: unknown[] = [];
+
+    let cmKey: ConceptMapDeterministicKey | undefined;
+    let meta: FileIndexEntryWithPkg | undefined;
+
+    // If the caller provided a package-filter, we treat that as a deterministic request for package ConceptMaps.
+    const shouldSkipServer = !!packageFilter;
+
+    if (typeof conceptMap !== 'string') {
+      meta = conceptMap;
+      try {
+        cmKey = this.toConceptMapDeterministicKey(meta);
+      } catch (e) {
+        errors.push(e);
+      }
+    } else if (!shouldSkipServer && this.fhirClient) {
+      const base = this.normalizeServerBaseUrl(this.fhirClient.getBaseUrl());
+      cmKey = await this.resolveServerConceptMapKey(conceptMap, base, errors);
+
+      // If server resolution failed, fall back to packages.
+      if (!cmKey) {
+        try {
+          meta = await this.getConceptMapMetadata(conceptMap, packageFilter);
+          cmKey = this.toConceptMapDeterministicKey(meta);
+        } catch (e) {
+          errors.push(e);
+        }
+      }
+    } else {
+      try {
+        meta = await this.getConceptMapMetadata(conceptMap, packageFilter);
+        cmKey = this.toConceptMapDeterministicKey(meta);
+      } catch (e) {
+        errors.push(e);
+      }
     }
 
-    let cmKey: ConceptMapDeterministicKey;
-    try {
-      cmKey = this.toConceptMapDeterministicKey(meta);
-    } catch {
-      return { status: 'unmapped', reason: 'unknown-conceptmap' };
+    if (!cmKey) {
+      const err: any = new Error(`ConceptMap '${typeof conceptMap === 'string' ? conceptMap : (conceptMap as any)?.filename || 'unknown'}' could not be resolved.`);
+      err.errors = errors;
+      throw this.prethrow(err);
     }
+
     const cmKeyStr = this.toConceptMapKeyString(cmKey);
 
     // Layer 1: small ConceptMap index LRU
@@ -1076,13 +1239,17 @@ export class FhirTerminologyRuntime {
     // Local evaluation: load and index ConceptMap
     let cm: any;
     try {
-      /* c8 ignore next */
-      if (cmKey.kind !== 'package') return { status: 'unmapped', reason: 'unknown-conceptmap' };
-      cm = await this.getConceptMapByFileName(cmKey.filename, cmKey.packageId, cmKey.packageVersion);
-    } catch {
-      return { status: 'unmapped', reason: 'unknown-conceptmap' };
+      cm = await this.loadConceptMapResource(cmKey);
+    } catch (e) {
+      const err: any = new Error(`Failed to load ConceptMap for key '${cmKeyStr}'.`);
+      err.errors = errors.concat([e]);
+      throw this.prethrow(err);
     }
-    if (!cm || cm.resourceType !== 'ConceptMap') return { status: 'unmapped', reason: 'unknown-conceptmap' };
+    if (!cm || cm.resourceType !== 'ConceptMap') {
+      const err: any = new Error(`Resolved ConceptMap '${cmKeyStr}' is not a ConceptMap.`);
+      err.errors = errors;
+      throw this.prethrow(err);
+    }
 
     const flatIndex = buildIndexFromConceptMap(cm);
 
@@ -1316,7 +1483,8 @@ export type {
   ConceptMapTranslation,
   ConceptMapTranslationResult,
   ConceptMapUnmappedReason,
-  SupportedConceptMapEquivalence
+  SupportedConceptMapEquivalence,
+  TerminologyFhirClient
 } from '../types';
 
 // Export implicit code systems for external usage
@@ -1356,6 +1524,12 @@ class LruCache<K, V> {
     if (this.map.size > this.maxSize) {
       const oldestKey = this.map.keys().next().value as K | undefined;
       if (oldestKey !== undefined) this.map.delete(oldestKey);
+    }
+  }
+
+  deleteWhere(predicate: (key: K, value: V) => boolean): void {
+    for (const [k, v] of this.map.entries()) {
+      if (predicate(k, v)) this.map.delete(k);
     }
   }
 }
