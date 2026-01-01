@@ -1525,6 +1525,7 @@ class LruCache<K, V> {
     }
   }
 
+  // eslint-disable-next-line no-unused-vars
   deleteWhere(predicate: (key: K, value: V) => boolean): void {
     for (const [k, v] of this.map.entries()) {
       if (predicate(k, v)) this.map.delete(k);
