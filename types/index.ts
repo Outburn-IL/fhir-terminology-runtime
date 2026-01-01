@@ -4,7 +4,7 @@
  *   Project name: fhir-terminology-runtime
  */
 
-import { FhirPackageExplorer } from 'fhir-package-explorer';
+import type { FhirPackageExplorer } from 'fhir-package-explorer';
 import { FhirVersion, Logger } from '@outburn/types';
 
 /**

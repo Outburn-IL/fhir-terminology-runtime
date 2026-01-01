@@ -17,9 +17,7 @@ import {
 import path from 'path';
 import fs from 'fs-extra';
 import { version as ftrVersion } from '../package.json';
-import {
-  FhirPackageExplorer
-} from 'fhir-package-explorer';
+import type { FhirPackageExplorer } from 'fhir-package-explorer';
 
 import {
   FhirPackageIdentifier,
