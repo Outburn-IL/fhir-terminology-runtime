@@ -4,9 +4,6 @@
  */
 
 import {
-  defaultLogger,
-  defaultPrethrow,
-  customPrethrower,
   flattenCodeSystemConcepts,
   toSystemCodeMapFromContains,
   mergeSystemMaps,
@@ -28,7 +25,6 @@ import {
 import type {
   TerminologyCacheMode,
   TerminologyRuntimeConfig,
-  Prethrower,
   CountResult,
   MembershipResult,
   ConceptProps,
@@ -74,7 +70,6 @@ const SUPPORTED_CONCEPTMAP_EQUIVALENCE: ReadonlySet<SupportedConceptMapEquivalen
 export class FhirTerminologyRuntime {
   private fpe: FhirPackageExplorer;
   private logger: Logger;
-  private prethrow: Prethrower;
   private cachePath: string;
   private cacheMode: TerminologyCacheMode;
   private fhirVersion: FhirVersion;
@@ -125,13 +120,12 @@ export class FhirTerminologyRuntime {
     conceptMapCache?: TerminologyConceptMapCache,
     fhirClient?: TerminologyFhirClient
   ) {
-    if (logger) {
-      this.logger = logger;
-      this.prethrow = customPrethrower(this.logger);
-    } else {
-      this.logger = defaultLogger;
-      this.prethrow = defaultPrethrow;
-    }
+    this.logger = logger || {
+      debug: () => { /* no-op */ },
+      info: () => { /* no-op */ },
+      warn: () => { /* no-op */ },
+      error: () => { /* no-op */ }
+    };
     this.cacheMode = cacheMode;
     this.fhirVersion = fhirVersion;
     this.fpe = fpe;
@@ -150,71 +144,63 @@ export class FhirTerminologyRuntime {
    * @param config - Configuration object with FPE and optional settings
    * @returns - A promise that resolves to a new instance of the FhirTerminologyRuntime class
    */
-  static async create(config: TerminologyRuntimeConfig): Promise<FhirTerminologyRuntime> {
-    const logger = config.logger || defaultLogger; // use provided logger or default
-    const prethrow = config.logger ? customPrethrower(logger) : defaultPrethrow;
-    
-    try {
-      const cacheMode = config.cacheMode || 'lazy'; // default cache mode
-      const fhirVersion = config.fhirVersion || '4.0.1'; // default FHIR version
-      const fpe = config.fpe;
+  static async create(config: TerminologyRuntimeConfig): Promise<FhirTerminologyRuntime> {    
+    const cacheMode = config.cacheMode || 'lazy'; // default cache mode
+    const fhirVersion = config.fhirVersion || '4.0.1'; // default FHIR version
+    const fpe = config.fpe;
 
-      // Create a new FhirTerminologyRuntime instance
-      const ftr = new FhirTerminologyRuntime(
-        fpe,
-        cacheMode,
-        fhirVersion,
-        config.logger,
-        config.membershipCache,
-        config.conceptMapCache,
-        config.fhirClient
-      );
+    // Create a new FhirTerminologyRuntime instance
+    const ftr = new FhirTerminologyRuntime(
+      fpe,
+      cacheMode,
+      fhirVersion,
+      config.logger,
+      config.membershipCache,
+      config.conceptMapCache,
+      config.fhirClient
+    );
 
-      let precache: boolean = false;
+    let precache: boolean = false;
 
-      // 'ensure' and 'rebuild' cache modes both trigger a walkthrough of all ValueSets.
-      // The difference is that 'rebuild' will first delete all existing expansions in the cache.
-      if (cacheMode === 'rebuild') {
-        precache = true;
-        // delete all existing expansions in the cache for the packages in the context
-        const packageList = fpe.getContextPackages().map(pkg => path.join(fpe.getCachePath(), `${pkg.id}#${pkg.version}`, '.ftr.expansions', versionedCacheDir));
-        // for each path, delete the directory if it exists
-        for (const expansionCacheDir of packageList) {
-          if (await fs.exists(expansionCacheDir)) {
-            fs.removeSync(expansionCacheDir);
-          }
+    // 'ensure' and 'rebuild' cache modes both trigger a walkthrough of all ValueSets.
+    // The difference is that 'rebuild' will first delete all existing expansions in the cache.
+    if (cacheMode === 'rebuild') {
+      precache = true;
+      // delete all existing expansions in the cache for the packages in the context
+      const packageList = fpe.getContextPackages().map(pkg => path.join(fpe.getCachePath(), `${pkg.id}#${pkg.version}`, '.ftr.expansions', versionedCacheDir));
+      // for each path, delete the directory if it exists
+      for (const expansionCacheDir of packageList) {
+        if (await fs.exists(expansionCacheDir)) {
+          fs.removeSync(expansionCacheDir);
         }
       }
-
-      if (cacheMode === 'ensure') precache = true;
-
-      if (precache) {
-        // Pre-cache ValueSet expansions
-        logger.info(`Pre-caching ValueSet expansions in '${cacheMode}' mode...`);
-        const vsErrors: string[] = [];
-        const allVs = await fpe.lookupMeta({ resourceType: 'ValueSet' });
-        for (const vs of allVs) {
-          const { filename, __packageId: packageId, __packageVersion: packageVersion, url } = vs as any;
-          try {
-            await ftr.ensureExpansionCached(filename, packageId, packageVersion);
-          } catch (e) {
-            // tolerate failures
-            /* c8 ignore next 2 */
-            vsErrors.push(`Failed to ${cacheMode} expansion for '${url || filename}' in package '${packageId}@${packageVersion}': ${e instanceof Error ? e.message : String(e)}`);
-          }
-        }
-        if (vsErrors.length > 0) {
-          /* c8 ignore next */
-          logger.warn(`Errors during pre-caching ValueSet expansions (${vsErrors.length} total):\n${vsErrors.join('\n')}`);
-        } else {
-          logger.info(`Pre-caching ValueSet expansions in '${cacheMode}' mode completed successfully.`);
-        }
-      }
-      return ftr;
-    } catch (e) {
-      /* c8 ignore next 2 */
-      throw prethrow(e);
     }
+
+    if (cacheMode === 'ensure') precache = true;
+
+    if (precache) {
+      // Pre-cache ValueSet expansions
+      ftr.getLogger().info(`Pre-caching ValueSet expansions in '${cacheMode}' mode...`);
+      const vsErrors: string[] = [];
+      const allVs = await fpe.lookupMeta({ resourceType: 'ValueSet' });
+      for (const vs of allVs) {
+        const { filename, __packageId: packageId, __packageVersion: packageVersion, url } = vs as any;
+        try {
+          await ftr.ensureExpansionCached(filename, packageId, packageVersion);
+        } catch (e) {
+          // tolerate failures
+          /* c8 ignore next 2 */
+          vsErrors.push(`Failed to ${cacheMode} expansion for '${url || filename}' in package '${packageId}@${packageVersion}': ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      if (vsErrors.length > 0) {
+        /* c8 ignore next */
+        ftr.getLogger().warn(`Errors during pre-caching ValueSet expansions (${vsErrors.length} total):\n${vsErrors.join('\n')}`);
+      } else {
+        ftr.getLogger().info(`Pre-caching ValueSet expansions in '${cacheMode}' mode completed successfully.`);
+      }
+    }
+    return ftr;
   };
 
   public getLogger(): Logger {
@@ -766,25 +752,21 @@ export class FhirTerminologyRuntime {
    * Get ValueSet expansion by any FSH style identifier (id, url or name), or by a metadata object.
    */
   public async expandValueSet(identifier: string | FileIndexEntryWithPkg, packageFilter?: FhirPackageIdentifier): Promise<any> {
-    try {
-      let metadata: FileIndexEntryWithPkg | undefined;
-      if (typeof identifier === 'string') {
-        metadata = await this.getValueSetMetadata(identifier, packageFilter);
-        if (!metadata) {
-          /* c8 ignore next 2 */
-          throw new Error(`ValueSet '${identifier}' not found in context. Could not get or generate an expansion.`);
-        }
-      } else {
-        metadata = identifier as FileIndexEntryWithPkg;
-        if (!metadata) {
-          /* c8 ignore next 2 */
-          throw new Error(`ValueSet with metadata: \n${JSON.stringify(identifier, null, 2)}\nnot found in context. Could not get or generate an expansion.`);
-        }
+    let metadata: FileIndexEntryWithPkg | undefined;
+    if (typeof identifier === 'string') {
+      metadata = await this.getValueSetMetadata(identifier, packageFilter);
+      if (!metadata) {
+        /* c8 ignore next 2 */
+        throw new Error(`ValueSet '${identifier}' not found in context. Could not get or generate an expansion.`);
       }
-      return await this.expandValueSetByMeta(metadata);
-    } catch (e) {
-      throw this.prethrow(e);
+    } else {
+      metadata = identifier as FileIndexEntryWithPkg;
+      if (!metadata) {
+        /* c8 ignore next 2 */
+        throw new Error(`ValueSet with metadata: \n${JSON.stringify(identifier, null, 2)}\nnot found in context. Could not get or generate an expansion.`);
+      }
     }
+    return await this.expandValueSetByMeta(metadata);
   }
 
   /**
@@ -851,71 +833,67 @@ export class FhirTerminologyRuntime {
    * @returns The full CodeSystem resource (content=complete).
    */
   public async resolveCompleteCodeSystem(url: string, sourcePackage: FhirPackageIdentifier): Promise<any> {
-    try {
-      if (!url) {
-        throw new Error('CodeSystem canonical URL missing.');
-      }
-
-      // Check if this is an implicit code system first
-      if (ImplicitCodeSystemRegistry.isImplicitCodeSystem(url)) {
-        // Return a synthetic CodeSystem resource with content='complete'
-        const concepts = ImplicitCodeSystemRegistry.getConcepts(url);
-        if (!concepts) {
-          /* c8 ignore next 2 */
-          throw new Error(`Implicit CodeSystem '${url}' provider returned no concepts.`);
-        }
-        
-        // Create a synthetic CodeSystem resource
-        return {
-          resourceType: 'CodeSystem',
-          url,
-          status: 'active',
-          content: 'complete',
-          concept: Array.from(concepts.entries()).map(([code, display]) => ({
-            code,
-            display
-          }))
-        };
-      }
-
-      // Prefer a semver-aware single resolution inside the source package context first.
-      // resolveMeta will internally pick the best version match instead of returning multiples.
-      let meta: any | undefined;
-      try {
-        meta = await this.resolveMetaCached({ resourceType: 'CodeSystem', url, package: sourcePackage });
-      } catch {
-        // swallow and fallback to global resolution
-      }
-
-      if (!meta) {
-        try {
-          meta = await this.resolveMetaCached({ resourceType: 'CodeSystem', url });
-        } catch {
-          /* c8 ignore next 2 */
-          throw new Error(`CodeSystem '${url}' not found (searched in package '${sourcePackage.id}@${sourcePackage.version}' then globally).`);
-        }
-      }
-
-      if (!meta?.content || (typeof meta?.content === 'string' && meta.content !== 'complete')) {
-        throw new Error(`CodeSystem '${url}' has content='${meta.content}' and cannot be expanded (only 'complete' supported).`);
-      }
-
-      const cs = await this.fpe.resolve({ filename: meta.filename, package: { id: meta.__packageId, version: meta.__packageVersion } });
-      
-      /* c8 ignore next 3 */
-      if (!cs) {
-        throw new Error(`Failed to load CodeSystem '${url}' from package '${meta.__packageId}@${meta.__packageVersion}'.`);
-      }
-      if (cs.resourceType !== 'CodeSystem') {
-        throw new Error(`Resolved resource for '${url}' is not a CodeSystem (got '${cs.resourceType || 'unknown'}').`);
-      }
-      if (cs.content !== 'complete') {
-        throw new Error(`CodeSystem '${url}' has content='${cs.content || 'undefined'}' and cannot be expanded (only 'complete' supported).`);
-      }
-      return cs;
-    } catch (e) {
-      throw this.prethrow(e);
+    if (!url) {
+      throw new Error('CodeSystem canonical URL missing.');
     }
+
+    // Check if this is an implicit code system first
+    if (ImplicitCodeSystemRegistry.isImplicitCodeSystem(url)) {
+      // Return a synthetic CodeSystem resource with content='complete'
+      const concepts = ImplicitCodeSystemRegistry.getConcepts(url);
+      if (!concepts) {
+        /* c8 ignore next 2 */
+        throw new Error(`Implicit CodeSystem '${url}' provider returned no concepts.`);
+      }
+      
+      // Create a synthetic CodeSystem resource
+      return {
+        resourceType: 'CodeSystem',
+        url,
+        status: 'active',
+        content: 'complete',
+        concept: Array.from(concepts.entries()).map(([code, display]) => ({
+          code,
+          display
+        }))
+      };
+    }
+
+    // Prefer a semver-aware single resolution inside the source package context first.
+    // resolveMeta will internally pick the best version match instead of returning multiples.
+    let meta: any | undefined;
+    try {
+      meta = await this.resolveMetaCached({ resourceType: 'CodeSystem', url, package: sourcePackage });
+    } catch {
+      // swallow and fallback to global resolution
+    }
+
+    if (!meta) {
+      try {
+        meta = await this.resolveMetaCached({ resourceType: 'CodeSystem', url });
+      } catch {
+        /* c8 ignore next 2 */
+        throw new Error(`CodeSystem '${url}' not found (searched in package '${sourcePackage.id}@${sourcePackage.version}' then globally).`);
+      }
+    }
+
+    if (!meta?.content || (typeof meta?.content === 'string' && meta.content !== 'complete')) {
+      throw new Error(`CodeSystem '${url}' has content='${meta.content}' and cannot be expanded (only 'complete' supported).`);
+    }
+
+    const cs = await this.fpe.resolve({ filename: meta.filename, package: { id: meta.__packageId, version: meta.__packageVersion } });
+    
+    /* c8 ignore next 3 */
+    if (!cs) {
+      throw new Error(`Failed to load CodeSystem '${url}' from package '${meta.__packageId}@${meta.__packageVersion}'.`);
+    }
+    if (cs.resourceType !== 'CodeSystem') {
+      throw new Error(`Resolved resource for '${url}' is not a CodeSystem (got '${cs.resourceType || 'unknown'}').`);
+    }
+    if (cs.content !== 'complete') {
+      throw new Error(`CodeSystem '${url}' has content='${cs.content || 'undefined'}' and cannot be expanded (only 'complete' supported).`);
+    }
+    return cs;
   }
 
   /**
@@ -1195,7 +1173,7 @@ export class FhirTerminologyRuntime {
     if (!cmKey) {
       const err: any = new Error(`ConceptMap '${typeof conceptMap === 'string' ? conceptMap : (conceptMap as any)?.filename || 'unknown'}' could not be resolved.`);
       err.errors = errors;
-      throw this.prethrow(err);
+      throw err;
     }
 
     const cmKeyStr = this.toConceptMapKeyString(cmKey);
@@ -1241,12 +1219,12 @@ export class FhirTerminologyRuntime {
     } catch (e) {
       const err: any = new Error(`Failed to load ConceptMap for key '${cmKeyStr}'.`);
       err.errors = errors.concat([e]);
-      throw this.prethrow(err);
+      throw err;
     }
     if (!cm || cm.resourceType !== 'ConceptMap') {
       const err: any = new Error(`Resolved ConceptMap '${cmKeyStr}' is not a ConceptMap.`);
       err.errors = errors;
-      throw this.prethrow(err);
+      throw err;
     }
 
     const flatIndex = buildIndexFromConceptMap(cm);
@@ -1466,7 +1444,6 @@ export class FhirTerminologyRuntime {
 export type {
   TerminologyCacheMode,
   TerminologyRuntimeConfig,
-  Prethrower,
   CountResult,
   UnknownReason,
   MembershipResult,
