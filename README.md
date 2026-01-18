@@ -398,7 +398,7 @@ Consider a large ValueSet `VS` and a code lookup `inValueSet('C10', VS)`:
 #### Priming is not ValueSet expansion caching
 
 FTR has two separate caching concepts:
-- **Expansion caching**: stores the expanded ValueSet JSON on disk under `.ftr/` alongside packages.
+- **Expansion caching**: stores the expanded ValueSet JSON on disk under `.ftr.expansions/` alongside package contents.
 - **Membership caching**: accelerates `inValueSet` lookups (in-memory LRUs + optional external cache).
 
 “Priming” only refers to the **external membership cache** behavior.
@@ -422,7 +422,7 @@ When expanding ValueSets the runtime resolves referenced CodeSystems by canonica
 
 ### Expansion Caching
 
-Expanded (or fallback) ValueSets are cached in a dedicated `.ftr` directory alongside source packages. Repeated calls reuse the cached expansion unless `cacheMode` is `none`.
+Expanded (or fallback) ValueSets are cached in a dedicated `.ftr.expansions/` directory inside package folders in the FHIR package cache folder. Repeated calls reuse the cached expansion unless `cacheMode` is `none`.
 
 ## Context
 You must provide an array of FHIR packages in `context`. Any package or its dependencies missing in the local FHIR package cache will be downloaded and installed (by [`fhir-package-installer`](https://github.com/Outburn-IL/fhir-package-installer)).
@@ -447,7 +447,7 @@ Supports `<id>#<version>`, `<id>@<version>`, `<id>` (latest version) or a packag
 Cached artifacts are stored under:
 
 ```
-<cachePath>/<packageId>#<packageVersion>/.ftr/<FTR version>/
+<cachePath>/<packageId>#<packageVersion>/.ftr.expansions/<FTR version>/
 ```
 - Filenames mirror originals in `<cachePath>/<packageId>#<packageVersion>/package`.
 - FTR Version directory uses major.minor.x (e.g. `0.1.x`).
