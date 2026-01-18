@@ -3,6 +3,10 @@ import path from 'path';
 import fs from 'fs-extra';
 import { FhirTerminologyRuntime } from '../src/index';
 import { ImplicitCodeSystemRegistry } from '../src/utils/terminology/implicitCodeSystems';
+import { version as ftrVersion } from '../package.json';
+
+const FTR_VERSION_EXTENSION_URL = 'http://fhir.fume.health/StructureDefinition/ftr-version';
+const FTR_EXPANSION_FAILED_EXTENSION_URL = 'http://fhir.fume.health/StructureDefinition/ftr-expansion-failed';
 
 describe('expandValueSet (unit)', () => {
   let ftr: FhirTerminologyRuntime;
@@ -77,7 +81,7 @@ describe('expandValueSet (unit)', () => {
     await expect(ftr.expandValueSet('missing')).rejects.toThrow('ValueSet');
   });
 
-  it('writes a cached __failure stub when expansion fails without fallback (cacheMode != none)', async () => {
+  it('writes a cached failure stub extension when expansion fails without fallback (cacheMode != none)', async () => {
     const tempCachePath = path.join(
       process.cwd(),
       'test',
@@ -121,7 +125,10 @@ describe('expandValueSet (unit)', () => {
     expect(await fs.pathExists(cacheFilePath)).toBe(true);
 
     const cached = await fs.readJSON(cacheFilePath);
-    expect(cached?.expansion?.__failure).toBe(true);
+    expect(cached?.expansion?.__failure).not.toBe(true);
+    const exts = Array.isArray(cached?.expansion?.extension) ? cached.expansion.extension : [];
+    expect(exts.some((e: any) => e?.url === FTR_VERSION_EXTENSION_URL && e?.valueCode === ftrVersion)).toBe(true);
+    expect(exts.some((e: any) => e?.url === FTR_EXPANSION_FAILED_EXTENSION_URL && e?.valueBoolean === true)).toBe(true);
 
     await fs.remove(tempCachePath);
   });
@@ -182,6 +189,8 @@ describe('expandValueSet (unit)', () => {
 
     const cached = await fs.readJSON(cacheFilePath);
     expect(cached?.expansion?.__failure).not.toBe(true);
+    const exts = Array.isArray(cached?.expansion?.extension) ? cached.expansion.extension : [];
+    expect(exts.some((e: any) => e?.url === FTR_EXPANSION_FAILED_EXTENSION_URL)).toBe(false);
     expect(cached?.expansion?.contains?.[0]?.code).toBe('A');
 
     await fs.remove(tempCachePath);
@@ -242,6 +251,8 @@ describe('expandValueSet (unit)', () => {
 
     const cached = await fs.readJSON(cacheFilePath);
     expect(cached?.expansion?.__failure).not.toBe(true);
+    const exts = Array.isArray(cached?.expansion?.extension) ? cached.expansion.extension : [];
+    expect(exts.some((e: any) => e?.url === FTR_EXPANSION_FAILED_EXTENSION_URL)).toBe(false);
     expect(cached?.expansion?.total).toBe(2);
 
     await fs.remove(tempCachePath);
@@ -305,7 +316,7 @@ describe('expandValueSet (unit)', () => {
     await fs.remove(tempCachePath);
   });
 
-  it('throws when a cached expansion is a __failure stub (short-circuit)', async () => {
+  it('throws when a cached expansion is a failure stub from the same runtime version (short-circuit)', async () => {
     const tempCachePath = path.join(
       process.cwd(),
       'test',
@@ -339,10 +350,86 @@ describe('expandValueSet (unit)', () => {
       resourceType: 'ValueSet',
       id: 'vs-cached-failure',
       url: 'http://example.org/ValueSet/vs-cached-failure',
-      expansion: { __failure: true }
+      expansion: {
+        extension: [
+          { url: FTR_VERSION_EXTENSION_URL, valueCode: ftrVersion },
+          { url: FTR_EXPANSION_FAILED_EXTENSION_URL, valueBoolean: true }
+        ]
+      }
     });
 
     await expect((ftrWithCache as any).expandValueSetByMeta(meta)).rejects.toThrow('Previous expansion attempt failed');
+
+    await fs.remove(tempCachePath);
+  });
+
+  it('re-attempts expansion when a cached failure stub is from a different runtime version', async () => {
+    const tempCachePath = path.join(
+      process.cwd(),
+      'test',
+      `.tmp-cache-read-failure-stub-version-mismatch-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    );
+    await fs.remove(tempCachePath);
+
+    const vsFilename = 'vs-cached-failure-old-version.json';
+    const originalVs = {
+      resourceType: 'ValueSet',
+      id: 'vs-cached-failure-old-version',
+      url: 'http://example.org/ValueSet/vs-cached-failure-old-version',
+      compose: {
+        include: [
+          {
+            system: 'http://example.org/system',
+            concept: [
+              { code: 'A', display: 'Alpha' },
+              { code: 'B', display: 'Beta' }
+            ]
+          }
+        ]
+      }
+    };
+
+    const fpeStub: any = {
+      getCachePath: () => tempCachePath,
+      getContextPackages: () => [pkg],
+      async resolve(args: any) {
+        if (args.filename !== vsFilename) throw new Error(`File not found: ${args.filename}`);
+        return originalVs;
+      },
+      async lookupMeta() {
+        return [];
+      }
+    };
+
+    const ftrWithCache = await FhirTerminologyRuntime.create({
+      fpe: fpeStub,
+      cacheMode: 'lazy',
+      fhirVersion: '4.0.1'
+    });
+
+    const meta: any = { resourceType: 'ValueSet', filename: vsFilename, __packageId: pkg.id, __packageVersion: pkg.version };
+    const cacheFilePath = (ftrWithCache as any).getCacheFilePath(vsFilename, pkg.id, pkg.version);
+    await fs.ensureDir(path.dirname(cacheFilePath));
+    await fs.writeJSON(cacheFilePath, {
+      resourceType: 'ValueSet',
+      id: 'vs-cached-failure-old-version',
+      url: 'http://example.org/ValueSet/vs-cached-failure-old-version',
+      expansion: {
+        extension: [
+          { url: FTR_VERSION_EXTENSION_URL, valueCode: '0.0.0' },
+          { url: FTR_EXPANSION_FAILED_EXTENSION_URL, valueBoolean: true }
+        ]
+      }
+    });
+
+    const expanded = await (ftrWithCache as any).expandValueSetByMeta(meta);
+    expect(expanded?.expansion?.total).toBe(2);
+    expect(Array.isArray(expanded?.expansion?.contains)).toBe(true);
+
+    const cachedAfter = await fs.readJSON(cacheFilePath);
+    const exts = Array.isArray(cachedAfter?.expansion?.extension) ? cachedAfter.expansion.extension : [];
+    expect(exts.some((e: any) => e?.url === FTR_EXPANSION_FAILED_EXTENSION_URL)).toBe(false);
+    expect(exts.some((e: any) => e?.url === FTR_VERSION_EXTENSION_URL && e?.valueCode === ftrVersion)).toBe(true);
 
     await fs.remove(tempCachePath);
   });

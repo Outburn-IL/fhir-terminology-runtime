@@ -1,42 +1,12 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 
 import {
-  defaultPrethrow,
-  customPrethrower,
   toSystemCodeMapFromContains,
   mergeSystemMaps,
   subtractSystemMaps,
   buildExpansionFromSystemMap,
   ImplicitCodeSystemRegistry
 } from '../src/utils';
-
-describe('utils/logger (unit)', () => {
-  it('defaultPrethrow returns same Error instance', () => {
-    const err = new Error('x');
-    expect(defaultPrethrow(err)).toBe(err);
-  });
-
-  it('defaultPrethrow wraps non-Error into Error', () => {
-    const err = defaultPrethrow('boom');
-    expect(err).toBeInstanceOf(Error);
-    expect(err.message).toBe('boom');
-  });
-
-  it('customPrethrower logs and returns Error', () => {
-    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
-    const prethrow = customPrethrower(logger);
-
-    const original = new Error('original');
-    const e1 = prethrow(original);
-    expect(e1).toBe(original);
-    expect(logger.error).toHaveBeenCalledTimes(1);
-
-    const e2 = prethrow('msg');
-    expect(e2).toBeInstanceOf(Error);
-    expect((e2 as Error).message).toBe('msg');
-    expect(logger.error).toHaveBeenCalledTimes(2);
-  });
-});
 
 describe('utils/terminology/systemMapHelpers (unit)', () => {
   it('toSystemCodeMapFromContains is defensive and builds map', () => {

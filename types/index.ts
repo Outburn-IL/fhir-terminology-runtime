@@ -26,8 +26,6 @@ export type TerminologyFhirClient = {
   getBaseUrl: () => string;
 };
 
-export type Prethrower = (msg: Error | any) => Error;
-
 /**
  * Terminology caching strategy.
  *
