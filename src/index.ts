@@ -46,6 +46,9 @@ const versionedCacheDir = `v${ftrVersion.split('.').slice(0, 2).join('.')}.x`;
 // Extension url used to annotate expansions with the runtime version that produced them.
 const FTR_VERSION_EXTENSION_URL = 'http://fhir.fume.health/StructureDefinition/ftr-version';
 
+// Extension url used to indicate that local expansion generation failed.
+const FTR_EXPANSION_FAILED_EXTENSION_URL = 'http://fhir.fume.health/StructureDefinition/ftr-expansion-failed';
+
 const FTR_DEFAULT_LIMITS = {
   valueSet: {
     smallThresholdUniqueCodes: 50,
@@ -248,6 +251,25 @@ export class FhirTerminologyRuntime {
       extension: existing.concat([{ url: FTR_VERSION_EXTENSION_URL, valueCode: ftrVersion }])
     };
     return { ...resource, expansion: nextExpansion };
+  }
+
+  private getExtensionValue(expansion: any, url: string): any | undefined {
+    const ext = Array.isArray(expansion?.extension) ? expansion.extension : [];
+    return ext.find((e: any) => e?.url === url);
+  }
+
+  private getFtrVersionFromExpansion(resource: any): string | undefined {
+    const exp = resource?.expansion;
+    const ext = this.getExtensionValue(exp, FTR_VERSION_EXTENSION_URL);
+    return typeof ext?.valueCode === 'string' && ext.valueCode.length > 0 ? ext.valueCode : undefined;
+  }
+
+  private isExpansionMarkedFailed(resource: any): boolean {
+    // Back-compat: old cached stubs used an internal sentinel field.
+    if (resource?.expansion?.__failure === true) return true;
+    const exp = resource?.expansion;
+    const ext = this.getExtensionValue(exp, FTR_EXPANSION_FAILED_EXTENSION_URL);
+    return ext?.valueBoolean === true;
   }
 
   private stableStringify(value: any): string {
@@ -689,11 +711,16 @@ export class FhirTerminologyRuntime {
     // Check cache
     const cached = this.cacheMode !== 'none' ? await this.getExpansionFromCache(filename, packageId, packageVersion!) : undefined;
     if (cached) {
-      if (cached?.expansion?.__failure === true) {
-        // Prior attempt already failed; short-circuit without recomputation
-        throw new Error(`Previous expansion attempt failed for ValueSet '${(cached.url || cached.id || filename)}' (cached).`);
+      if (this.isExpansionMarkedFailed(cached)) {
+        const cachedVersion = this.getFtrVersionFromExpansion(cached);
+        // Only short-circuit if the failure was produced by this exact runtime version.
+        // If version differs (or is missing), re-attempt expansion to allow upgrades to recover.
+        if (cachedVersion === ftrVersion) {
+          throw new Error(`Previous expansion attempt failed for ValueSet '${(cached.url || cached.id || filename)}' (cached).`);
+        }
+      } else {
+        return this.withFtrVersionExtensionInExpansion(cached);
       }
-      return this.withFtrVersionExtensionInExpansion(cached);
     }
 
     // Load original VS
@@ -750,9 +777,11 @@ export class FhirTerminologyRuntime {
         const failureStub = {
           ...vs,
           expansion: {
-            extension: [{ url: FTR_VERSION_EXTENSION_URL, valueCode: ftrVersion }],
+            extension: [
+              { url: FTR_VERSION_EXTENSION_URL, valueCode: ftrVersion },
+              { url: FTR_EXPANSION_FAILED_EXTENSION_URL, valueBoolean: true }
+            ],
             timestamp: new Date().toISOString(),
-            __failure: true
           }
         };
         try {
