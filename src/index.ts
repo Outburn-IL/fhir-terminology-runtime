@@ -43,6 +43,9 @@ import type {
 
 const versionedCacheDir = `v${ftrVersion.split('.').slice(0, 2).join('.')}.x`;
 
+// Extension url used to annotate expansions with the runtime version that produced them.
+const FTR_VERSION_EXTENSION_URL = 'http://fhir.fume.health/StructureDefinition/ftr-version';
+
 const FTR_DEFAULT_LIMITS = {
   valueSet: {
     smallThresholdUniqueCodes: 50,
@@ -230,6 +233,21 @@ export class FhirTerminologyRuntime {
   // ValueSet helpers
   private async getValueSetByFileName(filename: string, packageId: string, packageVersion: string): Promise<any> {
     return await this.fpe.resolve({ filename, package: { id: packageId, version: packageVersion } });
+  }
+
+  private withFtrVersionExtensionInExpansion(resource: any): any {
+    const expansion = resource?.expansion;
+    if (!expansion || typeof expansion !== 'object') return resource;
+
+    const existing = Array.isArray(expansion.extension) ? expansion.extension : [];
+    const alreadyPresent = existing.some((e: any) => e?.url === FTR_VERSION_EXTENSION_URL);
+    if (alreadyPresent) return resource;
+
+    const nextExpansion = {
+      ...expansion,
+      extension: existing.concat([{ url: FTR_VERSION_EXTENSION_URL, valueCode: ftrVersion }])
+    };
+    return { ...resource, expansion: nextExpansion };
   }
 
   private stableStringify(value: any): string {
@@ -675,7 +693,7 @@ export class FhirTerminologyRuntime {
         // Prior attempt already failed; short-circuit without recomputation
         throw new Error(`Previous expansion attempt failed for ValueSet '${(cached.url || cached.id || filename)}' (cached).`);
       }
-      return cached;
+      return this.withFtrVersionExtensionInExpansion(cached);
     }
 
     // Load original VS
@@ -703,7 +721,15 @@ export class FhirTerminologyRuntime {
       this.subtractSystemMaps(includeMap, excludeMap);
 
       const { contains, total } = this.buildExpansionFromSystemMap(includeMap);
-      const expanded = { ...vs, expansion: { timestamp: new Date().toISOString(), total, contains } };
+      const expanded = {
+        ...vs,
+        expansion: {
+          extension: [{ url: FTR_VERSION_EXTENSION_URL, valueCode: ftrVersion }],
+          timestamp: new Date().toISOString(),
+          total,
+          contains
+        }
+      };
 
       if (this.cacheMode !== 'none') {
         await this.saveExpansionToCache(filename, packageId, packageVersion!, expanded);
@@ -712,15 +738,23 @@ export class FhirTerminologyRuntime {
     } catch (e) {
       this.logger.warn(`Failed to expand ValueSet '${vs?.url || vs?.id || filename}': ${e instanceof Error ? e.message : String(e)}. Falling back to original expansion if present.`);
       if (vs?.expansion?.contains && Array.isArray(vs.expansion.contains)) {
+        const normalized = this.withFtrVersionExtensionInExpansion(vs);
         // Cache the original as well to avoid repeated regeneration attempts
         if (this.cacheMode !== 'none') {
-          await this.saveExpansionToCache(filename, packageId, packageVersion!, vs);
+          await this.saveExpansionToCache(filename, packageId, packageVersion!, normalized);
         }
-        return vs;
+        return normalized;
       }
       // No usable fallback expansion. Cache a stub marking failure to avoid repeated expensive retries.
       if (this.cacheMode !== 'none') {
-        const failureStub = { ...vs, expansion: { timestamp: new Date().toISOString(), __failure: true } };
+        const failureStub = {
+          ...vs,
+          expansion: {
+            extension: [{ url: FTR_VERSION_EXTENSION_URL, valueCode: ftrVersion }],
+            timestamp: new Date().toISOString(),
+            __failure: true
+          }
+        };
         try {
           await this.saveExpansionToCache(filename, packageId, packageVersion!, failureStub);
         /* c8 ignore next 4 */
