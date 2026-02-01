@@ -1,6 +1,6 @@
 {
   "name": "fhir-terminology-runtime",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Runtime FHIR terminology utilities",
   "main": "./dist/index.cjs",
   "module": "./dist/index.mjs",
@@ -53,11 +53,11 @@
     "@types/fs-extra": "^11.0.4",
     "@vitest/coverage-v8": "^3.2.4",
     "eslint": "^9.39.2",
-    "fhir-package-explorer": "^1.8.0",
+    "fhir-package-explorer": "^1.9.0",
     "rimraf": "^6.1.2",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
-    "typescript-eslint": "^8.53.0",
+    "typescript-eslint": "^8.54.0",
     "vitest": "^3.2.4"
   }
 }
