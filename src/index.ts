@@ -9,7 +9,10 @@ import {
   mergeSystemMaps,
   subtractSystemMaps,
   buildExpansionFromSystemMap,
-  ImplicitCodeSystemRegistry
+  ImplicitCodeSystemRegistry,
+  withExpansionLock,
+  getExpansionInflightKey,
+  DEFAULT_LOCK_TTL_MS
 } from './utils';
 import path from 'path';
 import fs from 'fs-extra';
@@ -604,10 +607,8 @@ export class FhirTerminologyRuntime {
     const referenced = Array.isArray(include.valueSet) ? include.valueSet : (include.valueSet ? [include.valueSet] : []);
     for (const vsUrl of referenced) {
       if (typeof vsUrl !== 'string') continue;
-      if (visited.has(vsUrl)) {
-        throw new Error(`Cyclic ValueSet reference detected: '${vsUrl}'.`);
-      }
-      visited.add(vsUrl);
+      // Note: Cycle detection is handled in expandValueSetByMeta using filename-based keys.
+      // This is more reliable than URL-based detection since metadata may not always have URLs.
       // resolve referenced ValueSet metadata first within source package, then fallback globally
       let vsMeta: FileIndexEntryWithPkg;
       try {
@@ -708,7 +709,21 @@ export class FhirTerminologyRuntime {
   private async expandValueSetByMeta(metadata: FileIndexEntryWithPkg, visited: Set<string> = new Set()): Promise<any> {
     const { filename, __packageId: packageId, __packageVersion: packageVersion } = metadata;
 
-    // Check cache
+    // Generate a unique key for this ValueSet (used for both cycle detection and locking).
+    // This is filename-based to work reliably even when URL is not in metadata.
+    const inflightKey = getExpansionInflightKey(packageId, packageVersion!, filename);
+
+    // Check for cycles BEFORE acquiring any locks.
+    // The visited set tracks ValueSets currently being expanded in the call stack.
+    // We use the inflightKey (filename-based) for reliable cycle detection since
+    // metadata may not always have the URL field populated.
+    if (visited.has(inflightKey)) {
+      const vsUrl = (metadata as any).url || filename;
+      throw new Error(`Cyclic ValueSet reference detected: '${vsUrl}'.`);
+    }
+    visited.add(inflightKey);
+
+    // Check cache first
     const cached = this.cacheMode !== 'none' ? await this.getExpansionFromCache(filename, packageId, packageVersion!) : undefined;
     if (cached) {
       if (this.isExpansionMarkedFailed(cached)) {
@@ -723,8 +738,50 @@ export class FhirTerminologyRuntime {
       }
     }
 
+    // Not in cache - use locking mechanism to coordinate expansion generation
+    // across multiple FTR instances (both in-process and cross-process)
+    const cacheFilePath = this.getCacheFilePath(filename, packageId, packageVersion!);
+    const skipDiskLock = this.cacheMode === 'none';
+
+    const lockResult = await withExpansionLock(
+      inflightKey,
+      cacheFilePath,
+      async () => this.generateExpansion(filename, packageId, packageVersion!, visited),
+      {
+        ttlMs: DEFAULT_LOCK_TTL_MS,
+        skipDiskLock,
+        logger: this.logger
+      }
+    );
+
+    if (lockResult.fromOtherProcess) {
+      // Another process completed the expansion - read from cache
+      const cachedAfterWait = await this.getExpansionFromCache(filename, packageId, packageVersion!);
+      if (cachedAfterWait) {
+        if (this.isExpansionMarkedFailed(cachedAfterWait)) {
+          const cachedVersion = this.getFtrVersionFromExpansion(cachedAfterWait);
+          if (cachedVersion === ftrVersion) {
+            throw new Error('Previous expansion attempt failed for ValueSet (cached by another process).');
+          }
+          // Different version - fall through to generate
+        } else {
+          return this.withFtrVersionExtensionInExpansion(cachedAfterWait);
+        }
+      }
+      // Cache still missing or outdated failure - generate ourselves
+      return this.generateExpansion(filename, packageId, packageVersion!, visited);
+    }
+
+    return lockResult.result;
+  }
+
+  /**
+   * Internal method that performs the actual expansion generation.
+   * Split out from expandValueSetByMeta to allow use with locking mechanism.
+   */
+  private async generateExpansion(filename: string, packageId: string, packageVersion: string, visited: Set<string> = new Set()): Promise<any> {
     // Load original VS
-    const vs = await this.getValueSetByFileName(filename, packageId, packageVersion!);
+    const vs = await this.getValueSetByFileName(filename, packageId, packageVersion);
     if (!vs || vs.resourceType !== 'ValueSet') throw new Error(`File '${filename}' not found as a ValueSet in package '${packageId}@${packageVersion}'.`);
 
     try {
@@ -735,13 +792,13 @@ export class FhirTerminologyRuntime {
       // Build include union map
       let includeMap = new Map<string, Map<string, string | undefined>>();
       for (const inc of includes) {
-        const incMap = await this.expandInclude(inc, { id: packageId, version: packageVersion! }, visited);
+        const incMap = await this.expandInclude(inc, { id: packageId, version: packageVersion }, visited);
         this.mergeSystemMaps(includeMap, incMap);
       }
       // Build exclude union map
       let excludeMap = new Map<string, Map<string, string | undefined>>();
       for (const exc of excludes) {
-        const excMap = await this.expandInclude(exc, { id: packageId, version: packageVersion! }, visited);
+        const excMap = await this.expandInclude(exc, { id: packageId, version: packageVersion }, visited);
         this.mergeSystemMaps(excludeMap, excMap);
       }
       // Subtract excludes
@@ -759,7 +816,7 @@ export class FhirTerminologyRuntime {
       };
 
       if (this.cacheMode !== 'none') {
-        await this.saveExpansionToCache(filename, packageId, packageVersion!, expanded);
+        await this.saveExpansionToCache(filename, packageId, packageVersion, expanded);
       }
       return expanded;
     } catch (e) {
@@ -768,7 +825,7 @@ export class FhirTerminologyRuntime {
         const normalized = this.withFtrVersionExtensionInExpansion(vs);
         // Cache the original as well to avoid repeated regeneration attempts
         if (this.cacheMode !== 'none') {
-          await this.saveExpansionToCache(filename, packageId, packageVersion!, normalized);
+          await this.saveExpansionToCache(filename, packageId, packageVersion, normalized);
         }
         return normalized;
       }
@@ -785,7 +842,7 @@ export class FhirTerminologyRuntime {
           }
         };
         try {
-          await this.saveExpansionToCache(filename, packageId, packageVersion!, failureStub);
+          await this.saveExpansionToCache(filename, packageId, packageVersion, failureStub);
         /* c8 ignore next 4 */
         } catch {
           /* ignore */
