@@ -231,20 +231,12 @@ describe('expansionLock (unit)', () => {
 
       it('treats lock with invalid timestamp as stale', async () => {
         await fs.ensureDir(path.dirname(testLockFile));
-        // Write a lock with timestamp that will cause Date.parse to fail
-        // (results in NaN which makes the lock appear stale due to NaN comparison)
+        // Locks with invalid timestamp strings should be treated as stale (expired)
         await fs.writeJSON(testLockFile, {
           timestamp: 'not-a-valid-date',
           pid: 12345
         });
-        // This returns true because readLockFile validates timestamp is a string and pid is number
-        // The isLockStale check uses the string and NaN-1000 > 5min is true (NaN comparisons are false)
-        // Actually, NaN > threshold returns false, so (now - NaN) > ttl returns false
-        // Let me verify the expected behavior: NaN - now is NaN, NaN > ttl is false
-        // So the lock is NOT considered stale. Let's test that the lock IS held.
-        // Actually, looking at the code: (now - lockTime) > ttlMs where lockTime is NaN
-        // now - NaN = NaN, NaN > ttlMs = false, so lock is NOT stale
-        expect(await isDiskLockHeld(testLockFile)).toBe(true);
+        expect(await isDiskLockHeld(testLockFile)).toBe(false);
       });
 
       it('treats lock with timestamp causing parse error as stale', async () => {
@@ -440,11 +432,7 @@ describe('expansionLock (unit)', () => {
     });
 
     it('handles lock race loss by returning fromOtherProcess', async () => {
-      const lockPath = getLockFilePath(testCacheFile);
       let attemptCount = 0;
-
-      // Simulate a race condition by creating lock after initial check but before acquire
-      const originalAcquireDiskLock = await import('../src/utils/terminology/expansionLock').then(m => m.acquireDiskLock);
       
       // First request starts, no lock exists initially
       // Second request beats us to acquiring the lock
@@ -483,8 +471,6 @@ describe('expansionLock (unit)', () => {
     });
 
     it('handles disk lock race where lock is acquired between check and acquire', async () => {
-      const lockPath = getLockFilePath(testCacheFile);
-      
       // Use a unique key for this test to avoid interference
       const uniqueKey = 'race-between-check-and-acquire-' + Date.now();
       
