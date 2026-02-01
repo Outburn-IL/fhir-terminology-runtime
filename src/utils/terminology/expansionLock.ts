@@ -146,14 +146,11 @@ async function readLockFile(lockPath: string): Promise<LockFileContent | undefin
  * Check if a lockfile is stale based on its timestamp and the configured TTL.
  */
 function isLockStale(lock: LockFileContent, ttlMs: number = DEFAULT_LOCK_TTL_MS): boolean {
-  try {
-    const lockTime = new Date(lock.timestamp).getTime();
-    const now = Date.now();
-    return (now - lockTime) > ttlMs;
-  } catch {
-    // Invalid timestamp - treat as stale
-    return true;
-  }
+  const lockTime = new Date(lock.timestamp).getTime();
+  // Invalid timestamp (NaN) - treat as stale
+  if (isNaN(lockTime)) return true;
+  const now = Date.now();
+  return (now - lockTime) > ttlMs;
 }
 
 /**
