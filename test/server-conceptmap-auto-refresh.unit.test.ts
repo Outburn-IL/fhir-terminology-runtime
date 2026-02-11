@@ -205,10 +205,13 @@ describe('Server ConceptMap auto-refresh', () => {
       serverConceptMapPollingIntervalMs: 50
     });
 
+    const pollSpy = vi.spyOn(ftr as any, 'pollServerConceptMaps');
+
     await ftr.translateConceptMap('A', 'cm1');
 
     await vi.advanceTimersByTimeAsync(55);
     expect(fhirClient.conditionalRead).toHaveBeenCalledTimes(1);
+    expect(pollSpy).toHaveBeenCalledTimes(1);
 
     const expectedPrefix = `server:${baseUrl}/ConceptMap/cm1`;
     expect(external.clearNamespace).toHaveBeenCalledWith(expectedPrefix);
@@ -216,6 +219,8 @@ describe('Server ConceptMap auto-refresh', () => {
     // If we advance again, the CM should have been removed from the refresh set.
     await vi.advanceTimersByTimeAsync(200);
     expect(fhirClient.conditionalRead).toHaveBeenCalledTimes(1);
+    // Interval should have been cleared, so no more poll invocations.
+    expect(pollSpy).toHaveBeenCalledTimes(1);
   }, 120000);
 
   test('warns and reduces polling when no version signals are present', async () => {
@@ -331,17 +336,21 @@ describe('Server ConceptMap auto-refresh', () => {
       serverConceptMapPollingIntervalMs: 50
     });
 
+    const pollSpy = vi.spyOn(ftr as any, 'pollServerConceptMaps');
+
     // Initial load starts tracking + timer.
     await ftr.translateConceptMap('A', 'cm1');
 
     // Verify polling was active.
     await vi.advanceTimersByTimeAsync(55);
     expect(fhirClient.conditionalRead).toHaveBeenCalledTimes(1);
+    expect(pollSpy).toHaveBeenCalledTimes(1);
 
     // Clearing should remove it from the refresh set so further polls do nothing.
     await ftr.clearServerConceptMapsFromCache();
 
     await vi.advanceTimersByTimeAsync(200);
     expect(fhirClient.conditionalRead).toHaveBeenCalledTimes(1);
+    expect(pollSpy).toHaveBeenCalledTimes(1);
   }, 120000);
 });

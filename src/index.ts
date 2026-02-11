@@ -269,6 +269,13 @@ export class FhirTerminologyRuntime {
     this.startServerConceptMapAutoRefreshIfNeeded();
   }
 
+  private stopServerConceptMapAutoRefreshIfIdle(): void {
+    if (this.serverConceptMapRefreshState.size !== 0) return;
+    if (!this.serverConceptMapPollingTimer) return;
+    clearInterval(this.serverConceptMapPollingTimer);
+    this.serverConceptMapPollingTimer = undefined;
+  }
+
   private reduceServerConceptMapPollingToOneHour(reason: string): void {
     if (this.serverConceptMapConditionalReadsUnsupported) return;
     this.serverConceptMapConditionalReadsUnsupported = true;
@@ -337,7 +344,10 @@ export class FhirTerminologyRuntime {
     if (!client) return;
     if (typeof client.conditionalRead !== 'function') return;
     if (this.serverConceptMapPollingIntervalMs <= 0) return;
-    if (this.serverConceptMapRefreshState.size === 0) return;
+    if (this.serverConceptMapRefreshState.size === 0) {
+      this.stopServerConceptMapAutoRefreshIfIdle();
+      return;
+    }
 
     const epochAtStart = this.serverConceptMapRefreshEpoch;
 
@@ -430,6 +440,7 @@ export class FhirTerminologyRuntime {
       }
     } finally {
       this.serverConceptMapPollInProgress = false;
+      this.stopServerConceptMapAutoRefreshIfIdle();
     }
   }
 
@@ -702,10 +713,7 @@ export class FhirTerminologyRuntime {
     }
 
     // If there are no tracked server ConceptMaps left, stop the interval.
-    if (this.serverConceptMapRefreshState.size === 0 && this.serverConceptMapPollingTimer) {
-      clearInterval(this.serverConceptMapPollingTimer);
-      this.serverConceptMapPollingTimer = undefined;
-    }
+    this.stopServerConceptMapAutoRefreshIfIdle();
   }
 
   private async getConceptMapMetadata(identifier: string, packageFilter?: FhirPackageIdentifier): Promise<FileIndexEntryWithPkg> {
