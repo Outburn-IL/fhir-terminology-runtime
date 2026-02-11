@@ -298,6 +298,35 @@ await ftr.clearServerConceptMapsFromCache();
 await ftr.clearServerConceptMapsFromCache('https://example.org/fhir');
 ```
 
+### Server ConceptMap auto-refresh (polling)
+
+If you provide a `fhirClient` that supports `conditionalRead(...)`, FTR can automatically keep **server** ConceptMaps fresh by polling the server and evicting/refreshing caches when the ConceptMap content changes.
+
+Enable/configure via `serverConceptMapPollingIntervalMs`:
+
+```ts
+const ftr = await FhirTerminologyRuntime.create({
+  fpe,
+  cacheMode: 'lazy',
+  fhirVersion: '4.0.1',
+  fhirClient,
+  // Default: 30000. Set <= 0 to disable.
+  serverConceptMapPollingIntervalMs: 30_000
+});
+```
+
+How it works:
+
+- Polling starts only after a server ConceptMap has been loaded at least once (e.g. via `translateConceptMap(...)`) and only for ConceptMaps that were resolved from the **currently configured** `fhirClient.getBaseUrl()`.
+- Polling requires `fhirClient.conditionalRead(...)`. Without it, no polling is performed.
+- Each poll uses conditional reads (based on `meta.versionId` / `meta.lastUpdated` and/or `ETag`) and:
+  - `304` → no work.
+  - `200` → compares ConceptMap *content* (ignoring `meta`) to avoid cache churn; if content changed, caches are evicted and the ConceptMap is re-indexed and re-primed.
+  - `404` / `410` → evicts caches and stops polling that ConceptMap.
+
+Server compatibility guard:
+- If the server appears not to honor conditional reads (for example, returns `200` with unchanged content even when a condition was sent, or does not provide version signals), FTR will log a warning (if a `logger` is provided) and reduce polling to **1 hour** to avoid unnecessary traffic and cache churn.
+
 ### Translation caching (`conceptMapCache`)
 
 `translateConceptMap` uses multiple caching layers similar to `inValueSet`:

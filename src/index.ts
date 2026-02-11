@@ -89,6 +89,24 @@ export class FhirTerminologyRuntime {
 
   private fhirClient?: TerminologyFhirClient;
 
+  // ========== Server ConceptMap auto-refresh (polling) ==========
+
+  private serverConceptMapPollingIntervalMs: number;
+  private serverConceptMapPollingTimer?: NodeJS.Timeout;
+  private serverConceptMapPollInProgress = false;
+  private serverConceptMapConditionalReadsUnsupported = false;
+  private serverConceptMapConditionalReadsWarned = false;
+
+  private serverConceptMapRefreshState: Map<
+    string,
+    {
+      cmKey: Extract<ConceptMapDeterministicKey, { kind: 'server' }>;
+      id: string;
+      condition: { versionId?: string; lastUpdated?: string };
+      contentSig: string;
+    }
+  > = new Map();
+
   // Cache for resolving ValueSet identifiers (url/id/name) -> metadata.
   // Keyed by identifier + packageFilter.
   private valueSetIdentifierMetaCache: Map<string, Promise<FileIndexEntryWithPkg>> = new Map();
@@ -127,7 +145,8 @@ export class FhirTerminologyRuntime {
     logger?: Logger,
     membershipCache?: TerminologyMembershipCache,
     conceptMapCache?: TerminologyConceptMapCache,
-    fhirClient?: TerminologyFhirClient
+    fhirClient?: TerminologyFhirClient,
+    serverConceptMapPollingIntervalMs: number = 30000
   ) {
     this.logger = logger || {
       debug: () => { /* no-op */ },
@@ -142,6 +161,7 @@ export class FhirTerminologyRuntime {
     this.membershipCache = membershipCache;
     this.conceptMapCache = conceptMapCache;
     this.fhirClient = fhirClient;
+    this.serverConceptMapPollingIntervalMs = serverConceptMapPollingIntervalMs;
   };
 
   /**
@@ -166,7 +186,8 @@ export class FhirTerminologyRuntime {
       config.logger,
       config.membershipCache,
       config.conceptMapCache,
-      config.fhirClient
+      config.fhirClient,
+      config.serverConceptMapPollingIntervalMs ?? 30000
     );
 
     let precache: boolean = false;
@@ -211,6 +232,199 @@ export class FhirTerminologyRuntime {
     }
     return ftr;
   };
+
+  /* c8 ignore start */
+
+  private conceptMapContentSignature(cm: any): string {
+    if (!cm || typeof cm !== 'object') return '';
+    // Exclude meta from signature so servers that churn meta fields (e.g., lastUpdated)
+    // without actual content changes don't trigger unnecessary cache churn.
+    const copy: any = Array.isArray(cm) ? cm.slice() : { ...cm };
+    try {
+      delete copy.meta;
+    } catch {
+      /* ignore */
+    }
+    return this.stableStringify(copy);
+  }
+
+  private startServerConceptMapAutoRefreshIfNeeded(): void {
+    if (this.serverConceptMapPollingIntervalMs <= 0) return;
+    if (!this.fhirClient) return;
+    if (typeof this.fhirClient.conditionalRead !== 'function') return;
+    if (this.serverConceptMapPollingTimer) return;
+
+    this.serverConceptMapPollingTimer = setInterval(() => {
+      void this.pollServerConceptMaps();
+    }, this.serverConceptMapPollingIntervalMs);
+    this.serverConceptMapPollingTimer.unref?.();
+  }
+
+  private restartServerConceptMapAutoRefresh(): void {
+    if (this.serverConceptMapPollingTimer) {
+      clearInterval(this.serverConceptMapPollingTimer);
+      this.serverConceptMapPollingTimer = undefined;
+    }
+    this.startServerConceptMapAutoRefreshIfNeeded();
+  }
+
+  private reduceServerConceptMapPollingToOneHour(reason: string): void {
+    if (this.serverConceptMapConditionalReadsUnsupported) return;
+    this.serverConceptMapConditionalReadsUnsupported = true;
+    this.serverConceptMapPollingIntervalMs = 60 * 60 * 1000;
+
+    if (!this.serverConceptMapConditionalReadsWarned) {
+      this.serverConceptMapConditionalReadsWarned = true;
+      this.logger?.warn?.(
+        `FHIR server ConceptMap auto-refresh: conditional reads appear unsupported or not honored (${reason}). ` +
+          `Reducing polling interval to 1 hour to avoid unnecessary cache churn.`
+      );
+    }
+
+    this.restartServerConceptMapAutoRefresh();
+  }
+
+  private async evictConceptMapCaches(cmKey: ConceptMapDeterministicKey, cmKeyStr: string): Promise<void> {
+    // In-memory
+    this.smallConceptMapIndexLru.deleteWhere((k) => k === cmKeyStr);
+    this.conceptMapResultLru.deleteWhere((k) => typeof k === 'string' && k.startsWith(`${cmKeyStr}|`));
+    this.externallyPrimedConceptMaps.delete(cmKeyStr);
+
+    // External (best-effort)
+    const external = this.conceptMapCache;
+    if (!external) return;
+    try {
+      await external.clearNamespace(cmKeyStr);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private trackServerConceptMapForAutoRefresh(cmKey: ConceptMapDeterministicKey, cm: any): void {
+    if (cmKey.kind !== 'server') return;
+    const client = this.fhirClient;
+    if (!client) return;
+    if (typeof client.conditionalRead !== 'function') return;
+
+    const currentBase = this.normalizeServerBaseUrl(client.getBaseUrl());
+    if (this.normalizeServerBaseUrl(cmKey.serverBaseUrl) !== currentBase) return;
+
+    const id = this.getConceptMapIdFromServerKey(cmKey);
+    if (!id) return;
+
+    const cmKeyStr = this.toConceptMapKeyString(cmKey);
+    const condition = {
+      versionId: cm?.meta?.versionId,
+      lastUpdated: cm?.meta?.lastUpdated
+    };
+    const contentSig = this.conceptMapContentSignature(cm);
+
+    if (!this.serverConceptMapRefreshState.has(cmKeyStr)) {
+      this.serverConceptMapRefreshState.set(cmKeyStr, { cmKey, id, condition, contentSig });
+    } else {
+      const existing = this.serverConceptMapRefreshState.get(cmKeyStr)!;
+      existing.condition = condition;
+      existing.contentSig = contentSig;
+    }
+
+    this.startServerConceptMapAutoRefreshIfNeeded();
+  }
+
+  private async pollServerConceptMaps(): Promise<void> {
+    if (this.serverConceptMapPollInProgress) return;
+    const client = this.fhirClient;
+    if (!client) return;
+    if (typeof client.conditionalRead !== 'function') return;
+    if (this.serverConceptMapPollingIntervalMs <= 0) return;
+    if (this.serverConceptMapRefreshState.size === 0) return;
+
+    this.serverConceptMapPollInProgress = true;
+    try {
+      for (const [cmKeyStr, state] of Array.from(this.serverConceptMapRefreshState.entries())) {
+        // Only refresh server ConceptMaps for the currently configured server.
+        const currentBase = this.normalizeServerBaseUrl(client.getBaseUrl());
+        if (this.normalizeServerBaseUrl(state.cmKey.serverBaseUrl) !== currentBase) continue;
+
+        let response: any;
+        const sentCondition = state.condition || {};
+        const hadCondition = !!(sentCondition.versionId || sentCondition.lastUpdated);
+        try {
+          response = await client.conditionalRead('ConceptMap', state.id, sentCondition, { noCache: true });
+        } catch {
+          // Best-effort polling: ignore errors.
+          continue;
+        }
+
+        const status = typeof response?.status === 'number' ? response.status : 0;
+
+        if (status === 304) {
+          continue;
+        }
+
+        if (status === 404 || status === 410) {
+          await this.evictConceptMapCaches(state.cmKey, cmKeyStr);
+          this.serverConceptMapRefreshState.delete(cmKeyStr);
+          continue;
+        }
+
+        if (status !== 200) {
+          continue;
+        }
+
+        const cm = response?.resource;
+        if (!cm || cm.resourceType !== 'ConceptMap') {
+          continue;
+        }
+
+        // Best-effort: if server only provides ETag/Last-Modified headers (and not meta fields),
+        // try to derive version signals for future conditional reads.
+        const headers = response?.headers || {};
+        const rawEtag = typeof headers?.etag === 'string' ? headers.etag : undefined;
+        const derivedVersionId = rawEtag
+          ? rawEtag.replace(/^W\//, '').replace(/^"/, '').replace(/"$/, '')
+          : undefined;
+
+        const nextCondition = {
+          versionId: cm?.meta?.versionId || derivedVersionId,
+          lastUpdated: cm?.meta?.lastUpdated
+        };
+        const nextSig = this.conceptMapContentSignature(cm);
+
+        const contentChanged = nextSig !== state.contentSig;
+
+        if (!contentChanged) {
+          // No actual content changes: do NOT churn caches.
+          state.condition = nextCondition;
+          const hasVersionSignals = !!(nextCondition.versionId || nextCondition.lastUpdated);
+          if (!hasVersionSignals) {
+            this.reduceServerConceptMapPollingToOneHour('resource meta missing versionId/lastUpdated');
+          } else if (hadCondition) {
+            // Server returned 200 with identical content despite us providing a condition.
+            this.reduceServerConceptMapPollingToOneHour('received 200 with unchanged ConceptMap content');
+          }
+          continue;
+        }
+
+        // Content changed: evict caches and prime again (best-effort).
+        await this.evictConceptMapCaches(state.cmKey, cmKeyStr);
+
+        const flatIndex = buildIndexFromConceptMap(cm);
+        if (flatIndex.uniqueSourceCodeCount <= FTR_DEFAULT_LIMITS.conceptMap.smallThresholdUniqueSourceCodes) {
+          this.smallConceptMapIndexLru.set(cmKeyStr, flatIndex);
+          await this.primeExternalConceptMapCacheIfProvided(state.cmKey, cmKeyStr, flatIndex, true);
+        } else {
+          await this.primeExternalConceptMapCacheIfProvided(state.cmKey, cmKeyStr, flatIndex, false);
+        }
+
+        state.condition = nextCondition;
+        state.contentSig = nextSig;
+      }
+    } finally {
+      this.serverConceptMapPollInProgress = false;
+    }
+  }
+
+  /* c8 ignore stop */
 
   public getLogger(): Logger {
     return this.logger;
@@ -1348,6 +1562,9 @@ export class FhirTerminologyRuntime {
     }
 
     const flatIndex = buildIndexFromConceptMap(cm);
+
+    // Only server ConceptMaps already loaded into cache are tracked for auto-refresh.
+    this.trackServerConceptMapForAutoRefresh(cmKey, cm);
 
     // Promote to small index if under threshold
     if (flatIndex.uniqueSourceCodeCount <= FTR_DEFAULT_LIMITS.conceptMap.smallThresholdUniqueSourceCodes) {

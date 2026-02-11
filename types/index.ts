@@ -22,6 +22,19 @@ export type TerminologyFhirClient = {
    * - resolve('ConceptMap', { url: 'http://...' })
    */
   resolve: (resourceOrLiteral: string, searchParams?: Record<string, any>, options?: Record<string, any>) => Promise<any>;
+
+  /**
+   * Conditional read helper (preferred) used for server ConceptMap auto-refresh.
+   *
+   * Shape matches @outburn/fhir-client's `conditionalRead`.
+   */
+  conditionalRead?: (
+    resourceType: string,
+    id: string,
+    condition: { versionId?: string; lastUpdated?: string },
+    options?: { noCache?: boolean }
+  ) => Promise<{ status: number; headers?: Record<string, string | undefined>; resource?: any }>;
+
   /** Returns the configured server base URL. */
   getBaseUrl: () => string;
 };
@@ -82,6 +95,17 @@ export type TerminologyRuntimeConfig = {
    * will prefer resolving ConceptMaps from the server before falling back to packages.
    */
   fhirClient?: TerminologyFhirClient;
+
+  /**
+   * Polling interval for auto-refreshing **server** ConceptMaps already loaded into this runtime (ms).
+   *
+   * - Default: 30000 (same as @outburn/fume-mapping-provider's server polling default)
+   * - Set <= 0 to disable polling
+   *
+   * Note: if the server appears not to honor conditional reads, the runtime will log a warning
+   * (using the injected logger, if any) and reduce polling to 1 hour.
+   */
+  serverConceptMapPollingIntervalMs?: number;
 };
 
 export type UnknownReason =
