@@ -308,4 +308,40 @@ describe('Server ConceptMap auto-refresh', () => {
     expect(external.clearNamespace).toHaveBeenCalledTimes(1);
     expect(external.bulkSetCodes).toHaveBeenCalledTimes(2);
   }, 120000);
+
+  test('clearServerConceptMapsFromCache stops polling cleared server ConceptMaps', async () => {
+    vi.useFakeTimers();
+
+    const cmV1 = makeConceptMap('1', 'B');
+
+    const fhirClient = {
+      getBaseUrl: () => baseUrl,
+      resolve: vi.fn(async (resourceOrLiteral: string) => {
+        if (resourceOrLiteral === 'ConceptMap/cm1') return cmV1;
+        throw new Error(`unexpected resolve: ${resourceOrLiteral}`);
+      }),
+      conditionalRead: vi.fn(async () => ({ status: 304, headers: {}, resource: undefined }))
+    };
+
+    const ftr = await FhirTerminologyRuntime.create({
+      fpe,
+      fhirVersion: '4.0.1',
+      cacheMode: 'lazy',
+      fhirClient,
+      serverConceptMapPollingIntervalMs: 50
+    });
+
+    // Initial load starts tracking + timer.
+    await ftr.translateConceptMap('A', 'cm1');
+
+    // Verify polling was active.
+    await vi.advanceTimersByTimeAsync(55);
+    expect(fhirClient.conditionalRead).toHaveBeenCalledTimes(1);
+
+    // Clearing should remove it from the refresh set so further polls do nothing.
+    await ftr.clearServerConceptMapsFromCache();
+
+    await vi.advanceTimersByTimeAsync(200);
+    expect(fhirClient.conditionalRead).toHaveBeenCalledTimes(1);
+  }, 120000);
 });

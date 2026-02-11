@@ -96,6 +96,7 @@ export class FhirTerminologyRuntime {
   private serverConceptMapPollInProgress = false;
   private serverConceptMapConditionalReadsUnsupported = false;
   private serverConceptMapConditionalReadsWarned = false;
+  private serverConceptMapRefreshEpoch = 0;
 
   private serverConceptMapRefreshState: Map<
     string,
@@ -338,9 +339,14 @@ export class FhirTerminologyRuntime {
     if (this.serverConceptMapPollingIntervalMs <= 0) return;
     if (this.serverConceptMapRefreshState.size === 0) return;
 
+    const epochAtStart = this.serverConceptMapRefreshEpoch;
+
     this.serverConceptMapPollInProgress = true;
     try {
       for (const [cmKeyStr, state] of Array.from(this.serverConceptMapRefreshState.entries())) {
+        // If the refresh set was cleared while we were polling, stop immediately.
+        if (this.serverConceptMapRefreshEpoch !== epochAtStart) break;
+
         // Only refresh server ConceptMaps for the currently configured server.
         const currentBase = this.normalizeServerBaseUrl(client.getBaseUrl());
         if (this.normalizeServerBaseUrl(state.cmKey.serverBaseUrl) !== currentBase) continue;
@@ -354,6 +360,9 @@ export class FhirTerminologyRuntime {
           // Best-effort polling: ignore errors.
           continue;
         }
+
+        // Clearing during an in-flight conditional read should prevent any subsequent cache churn.
+        if (this.serverConceptMapRefreshEpoch !== epochAtStart) break;
 
         const status = typeof response?.status === 'number' ? response.status : 0;
 
@@ -654,9 +663,18 @@ export class FhirTerminologyRuntime {
       prefixes.push('server:');
     }
 
+    let clearedRefreshState = false;
+
     for (const prefix of prefixes) {
       this.smallConceptMapIndexLru.deleteWhere(k => typeof k === 'string' && k.startsWith(prefix));
       this.conceptMapResultLru.deleteWhere(k => typeof k === 'string' && k.startsWith(prefix));
+
+      for (const key of Array.from(this.serverConceptMapRefreshState.keys())) {
+        if (key.startsWith(prefix)) {
+          this.serverConceptMapRefreshState.delete(key);
+          clearedRefreshState = true;
+        }
+      }
 
       for (const key of Array.from(this.externallyPrimedConceptMaps.values())) {
         if (key.startsWith(prefix)) this.externallyPrimedConceptMaps.delete(key);
@@ -676,6 +694,17 @@ export class FhirTerminologyRuntime {
           /* ignore */
         }
       }
+    }
+
+    if (clearedRefreshState) {
+      // Invalidate any in-flight poll loop snapshot.
+      this.serverConceptMapRefreshEpoch++;
+    }
+
+    // If there are no tracked server ConceptMaps left, stop the interval.
+    if (this.serverConceptMapRefreshState.size === 0 && this.serverConceptMapPollingTimer) {
+      clearInterval(this.serverConceptMapPollingTimer);
+      this.serverConceptMapPollingTimer = undefined;
     }
   }
 
