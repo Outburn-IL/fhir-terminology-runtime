@@ -8,14 +8,18 @@ describe('ensureExpansionCached (unit)', () => {
     const tempCachePath = path.join(process.cwd(), 'test', '.tmp-cache-ensure-expansion');
     await fs.remove(tempCachePath);
 
-    const warnings: string[] = [];
+    const debugMessages: string[] = [];
 
     const logger: any = {
+      debug(msg: any) {
+        debugMessages.push(String(msg));
+      },
       info() {
         // no-op
       },
       warn(msg: any) {
-        warnings.push(String(msg));
+        // no-op (should not be used for this path anymore)
+        void msg;
       },
       error() {
         // no-op
@@ -56,7 +60,7 @@ describe('ensureExpansionCached (unit)', () => {
 
     await (ftr as any).ensureExpansionCached('vs.json', 'p', '1.0.0');
 
-    expect(warnings.some(w => w.includes('Failed to pre-cache ValueSet expansion for \'vs.json\' in \'p@1.0.0\''))).toBe(true);
+    expect(debugMessages.some(m => m.includes('Failed to pre-cache ValueSet expansion for \'vs.json\' in \'p@1.0.0\''))).toBe(true);
 
     await fs.remove(tempCachePath);
   });
