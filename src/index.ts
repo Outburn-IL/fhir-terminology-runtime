@@ -900,7 +900,7 @@ export class FhirTerminologyRuntime {
             } else {
               // CodeSystem lookup failed (e.g., content='not-present' like UCUM)
               // Do not fall back to code as display - leave display undefined for downstream consumers to decide
-              this.logger.warn(`CodeSystem lookup failed for '${systemUrl}', display values will be omitted: ${e instanceof Error ? e.message : String(e)}`);
+              this.logger.debug?.(`CodeSystem lookup failed for '${systemUrl}', display values will be omitted: ${e instanceof Error ? e.message : String(e)}`);
               csDict = undefined;
             }
           }
@@ -1071,7 +1071,7 @@ export class FhirTerminologyRuntime {
       }
       return expanded;
     } catch (e) {
-      this.logger.warn(`Failed to expand ValueSet '${vs?.url || vs?.id || filename}': ${e instanceof Error ? e.message : String(e)}. Falling back to original expansion if present.`);
+      this.logger.debug?.(`Failed to expand ValueSet '${vs?.url || vs?.id || filename}': ${e instanceof Error ? e.message : String(e)}. Falling back to original expansion if present.`);
       if (vs?.expansion?.contains && Array.isArray(vs.expansion.contains)) {
         const normalized = this.withFtrVersionExtensionInExpansion(vs);
         // Cache the original as well to avoid repeated regeneration attempts
@@ -1114,7 +1114,7 @@ export class FhirTerminologyRuntime {
         await this.expandValueSetByMeta(meta);
       } catch (e) {
         // tolerate failures during pre-generation
-        this.logger.warn(`Failed to pre-cache ValueSet expansion for '${filename}' in '${packageId}@${packageVersion}': ${e instanceof Error ? e.message : String(e)}`);
+        this.logger.debug?.(`Failed to pre-cache ValueSet expansion for '${filename}' in '${packageId}@${packageVersion}': ${e instanceof Error ? e.message : String(e)}`);
       }
     }
   }
