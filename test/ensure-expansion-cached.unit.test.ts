@@ -49,6 +49,7 @@ describe('ensureExpansionCached (unit)', () => {
 
     // Create and then delete the exact cache file path to simulate a missing cache file.
     const cacheFilePath = (ftr as any).getCacheFilePath('vs.json', 'p', '1.0.0');
+    expect(path.extname(cacheFilePath)).toBe('.expansion');
     await fs.ensureDir(path.dirname(cacheFilePath));
     await fs.writeFile(cacheFilePath, '{}');
     await fs.remove(cacheFilePath);
