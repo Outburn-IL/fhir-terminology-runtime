@@ -466,8 +466,18 @@ export class FhirTerminologyRuntime {
     return this.fpe;
   }
 
+  private getExpansionCacheRelativePath(sourceFilename: string): string {
+    // Cached expansions should not use a .json extension, otherwise validators may scan them
+    // as package resources and report duplicates.
+    const normalized = sourceFilename.replace(/\\/g, '/');
+    const parsed = path.posix.parse(normalized);
+    const expansionBasename = `${parsed.name}.expansion`;
+    return parsed.dir ? path.posix.join(parsed.dir, expansionBasename) : expansionBasename;
+  }
+
   private getCacheFilePath(filename: string, packageId: string, packageVersion: string): string {
-    return path.join(this.cachePath, `${packageId}#${packageVersion}`, '.ftr.expansions', versionedCacheDir, filename);
+    const cacheRelativePath = this.getExpansionCacheRelativePath(filename);
+    return path.join(this.cachePath, `${packageId}#${packageVersion}`, '.ftr.expansions', versionedCacheDir, cacheRelativePath);
   }
 
   // ValueSet helpers
