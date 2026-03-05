@@ -285,7 +285,7 @@ export class FhirTerminologyRuntime {
       this.serverConceptMapConditionalReadsWarned = true;
       this.logger?.warn?.(
         `FHIR server ConceptMap auto-refresh: conditional reads appear unsupported or not honored (${reason}). ` +
-          `Reducing polling interval to 1 hour to avoid unnecessary cache churn.`
+          'Reducing polling interval to 1 hour to avoid unnecessary cache churn.'
       );
     }
 
